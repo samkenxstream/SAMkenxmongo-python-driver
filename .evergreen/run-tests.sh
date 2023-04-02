@@ -11,6 +11,7 @@ set -o errexit  # Exit the script with error if any of the commands fail
 #  COVERAGE           If non-empty, run the test suite with coverage.
 #  TEST_ENCRYPTION    If non-empty, install pymongocrypt.
 #  LIBMONGOCRYPT_URL  The URL to download libmongocrypt.
+#  TEST_CRYPT_SHARED  If non-empty, install crypt_shared lib.
 
 if [ -n "${SET_XTRACE_ON}" ]; then
     set -o xtrace
@@ -25,10 +26,13 @@ GREEN_FRAMEWORK=${GREEN_FRAMEWORK:-}
 C_EXTENSIONS=${C_EXTENSIONS:-}
 COVERAGE=${COVERAGE:-}
 COMPRESSORS=${COMPRESSORS:-}
+MONGODB_VERSION=${MONGODB_VERSION:-}
 MONGODB_API_VERSION=${MONGODB_API_VERSION:-}
 TEST_ENCRYPTION=${TEST_ENCRYPTION:-}
+CRYPT_SHARED_LIB_PATH=${CRYPT_SHARED_LIB_PATH:-}
 LIBMONGOCRYPT_URL=${LIBMONGOCRYPT_URL:-}
 DATA_LAKE=${DATA_LAKE:-}
+TEST_ARGS=""
 
 if [ -n "$COMPRESSORS" ]; then
     export COMPRESSORS=$COMPRESSORS
@@ -66,13 +70,13 @@ fi
 
 if [ -z "$PYTHON_BINARY" ]; then
     # Use Python 3 from the server toolchain to test on ARM, POWER or zSeries if a
-    # system python3 doesn't exist or exists but is older than 3.6.
-    if is_python_36 "$(command -v python3)"; then
+    # system python3 doesn't exist or exists but is older than 3.7.
+    if is_python_37 "$(command -v python3)"; then
         PYTHON=$(command -v python3)
-    elif is_python_36 "$(command -v /opt/mongodbtoolchain/v3/bin/python3)"; then
+    elif is_python_37 "$(command -v /opt/mongodbtoolchain/v3/bin/python3)"; then
         PYTHON=$(command -v /opt/mongodbtoolchain/v3/bin/python3)
     else
-        echo "Cannot test without python3.6+ installed!"
+        echo "Cannot test without python3.7+ installed!"
     fi
 elif [ "$COMPRESSORS" = "snappy" ]; then
     createvirtualenv $PYTHON_BINARY snappytest
@@ -97,7 +101,8 @@ if [ -n "$TEST_PYOPENSSL" ]; then
     python -m pip install --prefer-binary pyopenssl requests service_identity
 fi
 
-if [ -n "$TEST_ENCRYPTION" ]; then
+if [ -n "$TEST_ENCRYPTION" ] || [ -n "$TEST_FLE_AZURE_AUTO" ] || [ -n "$TEST_FLE_GCP_AUTO" ]; then
+
     createvirtualenv $PYTHON venv-encryption
     trap "deactivate; rm -rf venv-encryption" EXIT HUP
     PYTHON=python
@@ -136,21 +141,49 @@ if [ -n "$TEST_ENCRYPTION" ]; then
     export PYMONGOCRYPT_LIB
 
     # TODO: Test with 'pip install pymongocrypt'
-    git clone --branch master https://github.com/mongodb/libmongocrypt.git libmongocrypt_git
+    git clone https://github.com/mongodb/libmongocrypt.git libmongocrypt_git
     python -m pip install --prefer-binary -r .evergreen/test-encryption-requirements.txt
     python -m pip install ./libmongocrypt_git/bindings/python
     python -c "import pymongocrypt; print('pymongocrypt version: '+pymongocrypt.__version__)"
     python -c "import pymongocrypt; print('libmongocrypt version: '+pymongocrypt.libmongocrypt_version())"
     # PATH is updated by PREPARE_SHELL for access to mongocryptd.
+fi
+
+if [ -n "$TEST_ENCRYPTION" ]; then
+    # Need aws dependency for On-Demand KMS Credentials.
+    # Need OSCP dependency to verify OCSP TSL args.
+    python -m pip install '.[aws,ocsp]'
 
     # Get access to the AWS temporary credentials:
     # CSFLE_AWS_TEMP_ACCESS_KEY_ID, CSFLE_AWS_TEMP_SECRET_ACCESS_KEY, CSFLE_AWS_TEMP_SESSION_TOKEN
     . $DRIVERS_TOOLS/.evergreen/csfle/set-temp-creds.sh
+
+    if [ -n "$TEST_CRYPT_SHARED" ]; then
+        CRYPT_SHARED_DIR=`dirname $CRYPT_SHARED_LIB_PATH`
+        echo "using crypt_shared_dir $CRYPT_SHARED_DIR"
+        export DYLD_FALLBACK_LIBRARY_PATH=$CRYPT_SHARED_DIR:$DYLD_FALLBACK_LIBRARY_PATH
+        export LD_LIBRARY_PATH=$CRYPT_SHARED_DIR:$LD_LIBRARY_PATH
+        export PATH=$CRYPT_SHARED_DIR:$PATH
+    fi
+    # Only run the encryption tests.
+    TEST_ARGS="-s test.test_encryption"
 fi
 
-if [ -z "$DATA_LAKE" ]; then
-    TEST_ARGS=""
-else
+if [ -n "$TEST_FLE_AZURE_AUTO" ] || [ -n "$TEST_FLE_GCP_AUTO" ]; then
+    if [[ -z "$SUCCESS" ]]; then
+        echo "Must define SUCCESS"
+        exit 1
+    fi
+
+    if echo "$MONGODB_URI" | grep -q "@"; then
+      echo "MONGODB_URI unexpectedly contains user credentials in FLE test!";
+      exit 1
+    fi
+
+    TEST_ARGS="-s test.test_on_demand_csfle"
+fi
+
+if [ -n "$DATA_LAKE" ]; then
     TEST_ARGS="-s test.test_data_lake"
 fi
 

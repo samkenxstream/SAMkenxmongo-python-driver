@@ -17,7 +17,7 @@ import time
 import unittest
 
 from mockupdb import MockupDB, going, wait_until
-from operations import operations
+from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure

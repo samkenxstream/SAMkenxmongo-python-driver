@@ -16,6 +16,7 @@
 
 import abc
 import datetime
+import enum
 from collections.abc import MutableMapping as _MutableMapping
 from typing import (
     Any,
@@ -198,6 +199,41 @@ class TypeRegistry(object):
         )
 
 
+class DatetimeConversion(int, enum.Enum):
+    """Options for decoding BSON datetimes."""
+
+    DATETIME = 1
+    """Decode a BSON UTC datetime as a :class:`datetime.datetime`.
+
+    BSON UTC datetimes that cannot be represented as a
+    :class:`~datetime.datetime` will raise an :class:`OverflowError`
+    or a :class:`ValueError`.
+
+    .. versionadded 4.3
+    """
+
+    DATETIME_CLAMP = 2
+    """Decode a BSON UTC datetime as a :class:`datetime.datetime`, clamping
+    to :attr:`~datetime.datetime.min` and :attr:`~datetime.datetime.max`.
+
+    .. versionadded 4.3
+    """
+
+    DATETIME_MS = 3
+    """Decode a BSON UTC datetime as a :class:`~bson.datetime_ms.DatetimeMS`
+    object.
+
+    .. versionadded 4.3
+    """
+
+    DATETIME_AUTO = 4
+    """Decode a BSON UTC datetime as a :class:`datetime.datetime` if possible,
+    and a :class:`~bson.datetime_ms.DatetimeMS` if not.
+
+    .. versionadded 4.3
+    """
+
+
 class _BaseCodecOptions(NamedTuple):
     document_class: Type[Mapping[str, Any]]
     tz_aware: bool
@@ -205,84 +241,96 @@ class _BaseCodecOptions(NamedTuple):
     unicode_decode_error_handler: str
     tzinfo: Optional[datetime.tzinfo]
     type_registry: TypeRegistry
+    datetime_conversion: Optional[DatetimeConversion]
 
 
 class CodecOptions(_BaseCodecOptions):
-    """Encapsulates options used encoding and / or decoding BSON.
+    """Encapsulates options used encoding and / or decoding BSON."""
 
-    The `document_class` option is used to define a custom type for use
-    decoding BSON documents. Access to the underlying raw BSON bytes for
-    a document is available using the :class:`~bson.raw_bson.RawBSONDocument`
-    type::
+    def __init__(self, *args, **kwargs):
+        """Encapsulates options used encoding and / or decoding BSON.
 
-      >>> from bson.raw_bson import RawBSONDocument
-      >>> from bson.codec_options import CodecOptions
-      >>> codec_options = CodecOptions(document_class=RawBSONDocument)
-      >>> coll = db.get_collection('test', codec_options=codec_options)
-      >>> doc = coll.find_one()
-      >>> doc.raw
-      '\\x16\\x00\\x00\\x00\\x07_id\\x00[0\\x165\\x91\\x10\\xea\\x14\\xe8\\xc5\\x8b\\x93\\x00'
+        The `document_class` option is used to define a custom type for use
+        decoding BSON documents. Access to the underlying raw BSON bytes for
+        a document is available using the :class:`~bson.raw_bson.RawBSONDocument`
+        type::
 
-    The document class can be any type that inherits from
-    :class:`~collections.abc.MutableMapping`::
+          >>> from bson.raw_bson import RawBSONDocument
+          >>> from bson.codec_options import CodecOptions
+          >>> codec_options = CodecOptions(document_class=RawBSONDocument)
+          >>> coll = db.get_collection('test', codec_options=codec_options)
+          >>> doc = coll.find_one()
+          >>> doc.raw
+          '\\x16\\x00\\x00\\x00\\x07_id\\x00[0\\x165\\x91\\x10\\xea\\x14\\xe8\\xc5\\x8b\\x93\\x00'
 
-      >>> class AttributeDict(dict):
-      ...     # A dict that supports attribute access.
-      ...     def __getattr__(self, key):
-      ...         return self[key]
-      ...     def __setattr__(self, key, value):
-      ...         self[key] = value
-      ...
-      >>> codec_options = CodecOptions(document_class=AttributeDict)
-      >>> coll = db.get_collection('test', codec_options=codec_options)
-      >>> doc = coll.find_one()
-      >>> doc._id
-      ObjectId('5b3016359110ea14e8c58b93')
+        The document class can be any type that inherits from
+        :class:`~collections.abc.MutableMapping`::
 
-    See :doc:`/examples/datetimes` for examples using the `tz_aware` and
-    `tzinfo` options.
+          >>> class AttributeDict(dict):
+          ...     # A dict that supports attribute access.
+          ...     def __getattr__(self, key):
+          ...         return self[key]
+          ...     def __setattr__(self, key, value):
+          ...         self[key] = value
+          ...
+          >>> codec_options = CodecOptions(document_class=AttributeDict)
+          >>> coll = db.get_collection('test', codec_options=codec_options)
+          >>> doc = coll.find_one()
+          >>> doc._id
+          ObjectId('5b3016359110ea14e8c58b93')
 
-    See :doc:`/examples/uuid` for examples using the `uuid_representation`
-    option.
+        See :doc:`/examples/datetimes` for examples using the `tz_aware` and
+        `tzinfo` options.
 
-    :Parameters:
-      - `document_class`: BSON documents returned in queries will be decoded
-        to an instance of this class. Must be a subclass of
-        :class:`~collections.abc.MutableMapping`. Defaults to :class:`dict`.
-      - `tz_aware`: If ``True``, BSON datetimes will be decoded to timezone
-        aware instances of :class:`~datetime.datetime`. Otherwise they will be
-        naive. Defaults to ``False``.
-      - `uuid_representation`: The BSON representation to use when encoding
-        and decoding instances of :class:`~uuid.UUID`. Defaults to
-        :data:`~bson.binary.UuidRepresentation.UNSPECIFIED`. New
-        applications should consider setting this to
-        :data:`~bson.binary.UuidRepresentation.STANDARD` for cross language
-        compatibility. See :ref:`handling-uuid-data-example` for details.
-      - `unicode_decode_error_handler`: The error handler to apply when
-        a Unicode-related error occurs during BSON decoding that would
-        otherwise raise :exc:`UnicodeDecodeError`. Valid options include
-        'strict', 'replace', 'backslashreplace', 'surrogateescape', and
-        'ignore'. Defaults to 'strict'.
-      - `tzinfo`: A :class:`~datetime.tzinfo` subclass that specifies the
-        timezone to/from which :class:`~datetime.datetime` objects should be
-        encoded/decoded.
-      - `type_registry`: Instance of :class:`TypeRegistry` used to customize
-        encoding and decoding behavior.
+        See :doc:`/examples/uuid` for examples using the `uuid_representation`
+        option.
 
-    .. versionchanged:: 4.0
-       The default for `uuid_representation` was changed from
-       :const:`~bson.binary.UuidRepresentation.PYTHON_LEGACY` to
-       :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
+        :Parameters:
+          - `document_class`: BSON documents returned in queries will be decoded
+            to an instance of this class. Must be a subclass of
+            :class:`~collections.abc.MutableMapping`. Defaults to :class:`dict`.
+          - `tz_aware`: If ``True``, BSON datetimes will be decoded to timezone
+            aware instances of :class:`~datetime.datetime`. Otherwise they will be
+            naive. Defaults to ``False``.
+          - `uuid_representation`: The BSON representation to use when encoding
+            and decoding instances of :class:`~uuid.UUID`. Defaults to
+            :data:`~bson.binary.UuidRepresentation.UNSPECIFIED`. New
+            applications should consider setting this to
+            :data:`~bson.binary.UuidRepresentation.STANDARD` for cross language
+            compatibility. See :ref:`handling-uuid-data-example` for details.
+          - `unicode_decode_error_handler`: The error handler to apply when
+            a Unicode-related error occurs during BSON decoding that would
+            otherwise raise :exc:`UnicodeDecodeError`. Valid options include
+            'strict', 'replace', 'backslashreplace', 'surrogateescape', and
+            'ignore'. Defaults to 'strict'.
+          - `tzinfo`: A :class:`~datetime.tzinfo` subclass that specifies the
+            timezone to/from which :class:`~datetime.datetime` objects should be
+            encoded/decoded.
+          - `type_registry`: Instance of :class:`TypeRegistry` used to customize
+            encoding and decoding behavior.
+          - `datetime_conversion`: Specifies how UTC datetimes should be decoded
+            within BSON. Valid options include 'datetime_ms' to return as a
+            DatetimeMS, 'datetime' to return as a datetime.datetime and
+            raising a ValueError for out-of-range values, 'datetime_auto' to
+            return DatetimeMS objects when the underlying datetime is
+            out-of-range and 'datetime_clamp' to clamp to the minimum and
+            maximum possible datetimes. Defaults to 'datetime'.
 
-    .. versionadded:: 3.8
-       `type_registry` attribute.
+        .. versionchanged:: 4.0
+           The default for `uuid_representation` was changed from
+           :const:`~bson.binary.UuidRepresentation.PYTHON_LEGACY` to
+           :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
 
-    .. warning:: Care must be taken when changing
-       `unicode_decode_error_handler` from its default value ('strict').
-       The 'replace' and 'ignore' modes should not be used when documents
-       retrieved from the server will be modified in the client application
-       and stored back to the server.
-    """
+        .. versionadded:: 3.8
+           `type_registry` attribute.
+
+        .. warning:: Care must be taken when changing
+           `unicode_decode_error_handler` from its default value ('strict').
+           The 'replace' and 'ignore' modes should not be used when documents
+           retrieved from the server will be modified in the client application
+           and stored back to the server.
+        """
+        super().__init__()
 
     def __new__(
         cls: Type["CodecOptions"],
@@ -292,6 +340,7 @@ class CodecOptions(_BaseCodecOptions):
         unicode_decode_error_handler: str = "strict",
         tzinfo: Optional[datetime.tzinfo] = None,
         type_registry: Optional[TypeRegistry] = None,
+        datetime_conversion: Optional[DatetimeConversion] = DatetimeConversion.DATETIME,
     ) -> "CodecOptions":
         doc_class = document_class or dict
         # issubclass can raise TypeError for generic aliases like SON[str, Any].
@@ -336,6 +385,7 @@ class CodecOptions(_BaseCodecOptions):
                 unicode_decode_error_handler,
                 tzinfo,
                 type_registry,
+                datetime_conversion,
             ),
         )
 
@@ -350,7 +400,7 @@ class CodecOptions(_BaseCodecOptions):
         return (
             "document_class=%s, tz_aware=%r, uuid_representation=%s, "
             "unicode_decode_error_handler=%r, tzinfo=%r, "
-            "type_registry=%r"
+            "type_registry=%r, datetime_conversion=%s"
             % (
                 document_class_repr,
                 self.tz_aware,
@@ -358,6 +408,7 @@ class CodecOptions(_BaseCodecOptions):
                 self.unicode_decode_error_handler,
                 self.tzinfo,
                 self.type_registry,
+                self.datetime_conversion,
             )
         )
 
@@ -371,6 +422,7 @@ class CodecOptions(_BaseCodecOptions):
             "unicode_decode_error_handler": self.unicode_decode_error_handler,
             "tzinfo": self.tzinfo,
             "type_registry": self.type_registry,
+            "datetime_conversion": self.datetime_conversion,
         }
 
     def __repr__(self):
@@ -406,6 +458,7 @@ def _parse_codec_options(options: Any) -> CodecOptions:
         "unicode_decode_error_handler",
         "tzinfo",
         "type_registry",
+        "datetime_conversion",
     }:
         if k == "uuidrepresentation":
             kwargs["uuid_representation"] = options[k]

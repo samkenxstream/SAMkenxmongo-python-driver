@@ -1,42 +1,269 @@
 Changelog
 =========
 
+Changes in Version 4.4
+-----------------------
+
+- Added support for passing a list containing (key, direction) pairs
+  or keys to :meth:`~pymongo.collection.Collection.create_index`.
+- **BETA** Added support for range queries on client side field level encrypted collections.
+- pymongocrypt 1.5.0 or later is now required for client side field level
+  encryption support.
+- Improved support for Pyright to improve typing support for IDEs like Visual Studio Code or Visual Studio.
+- Improved support for type-checking with MyPy "strict" mode (`--strict`).
+- Added support for Python 3.11.
+
+Issues Resolved
+...............
+
+See the `PyMongo 4.4 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 4.4 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=34354
+
+Changes in Version 4.3.3
+------------------------
+
+Version 4.3.3 documents support for the following:
+
+- :ref:`CSFLE on-demand credentials` for cloud KMS providers.
+- Authentication support for :ref:`EKS Clusters`.
+- Added the :ref:`timeout-example` example page to improve the documentation
+  for :func:`pymongo.timeout`.
+
+Bug Fixes
+.........
+- Fixed a performance regression in :meth:`~gridfs.GridFSBucket.download_to_stream`
+  and :meth:`~gridfs.GridFSBucket.download_to_stream_by_name` by reading in chunks
+  instead of line by line (`PYTHON-3502`_).
+- Improved performance of :meth:`gridfs.grid_file.GridOut.read` and
+  :meth:`gridfs.grid_file.GridOut.readline` (`PYTHON-3508`_).
+
+Issues Resolved
+...............
+
+See the `PyMongo 4.3.3 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PYTHON-3502: https://jira.mongodb.org/browse/PYTHON-3502
+.. _PYTHON-3508: https://jira.mongodb.org/browse/PYTHON-3508
+.. _PyMongo 4.3.3 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=34709
+
+Changes in Version 4.3 (4.3.2)
+------------------------------
+
+Note: We withheld uploading tags 4.3.0 and 4.3.1 to PyPI due to a
+version handling error and a necessary documentation update.
+
+`dnspython <https://pypi.python.org/pypi/dnspython>`_ is now a required
+dependency. This change makes PyMongo easier to install for use with "mongodb+srv://"
+connection strings and `MongoDB Atlas <https://www.mongodb.com/cloud>`_.
+
+PyMongo 4.3 brings a number of improvements including:
+
+- Added support for decoding BSON datetimes outside of the range supported
+  by Python's :class:`~datetime.datetime` builtin. See
+  :ref:`handling-out-of-range-datetimes` for examples, as well as
+  :class:`bson.datetime_ms.DatetimeMS`,
+  :class:`bson.codec_options.DatetimeConversion`, and
+  :class:`bson.codec_options.CodecOptions`'s ``datetime_conversion``
+  parameter for more details (`PYTHON-1824`_).
+- PyMongo now resets its locks and other shared state in the child process
+  after a :py:func:`os.fork` to reduce the frequency of deadlocks. Note that
+  deadlocks are still possible because libraries that PyMongo depends like
+  OpenSSL cannot be made fork() safe in multithreaded applications.
+  (`PYTHON-2484`_). For more info see :ref:`pymongo-fork-safe`.
+- When used with MongoDB 6.0+, :class:`~pymongo.change_stream.ChangeStream` s
+  now allow for new types of events (such as DDL and C2C replication events)
+  to be recorded with the new parameter ``show_expanded_events``
+  that can be passed to methods such as :meth:`~pymongo.collection.Collection.watch`.
+- PyMongo now internally caches AWS credentials that it fetches from AWS
+  endpoints, to avoid rate limitations.  The cache is cleared when the
+  credentials expire or an error is encountered.
+- When using the ``MONGODB-AWS`` authentication mechanism with the
+  ``aws`` extra, the behavior of credential fetching has changed with
+  ``pymongo_auth_aws>=1.1.0``.  Please see :doc:`examples/authentication` for
+  more information.
+
+Bug fixes
+.........
+
+- Fixed a bug where  :class:`~pymongo.change_stream.ChangeStream`
+  would allow an app to retry calling ``next()`` or ``try_next()`` even
+  after non-resumable errors (`PYTHON-3389`_).
+- Fixed a bug where the client could be unable to discover the new primary
+  after a simultaneous replica set election and reconfig (`PYTHON-2970`_).
+
+Issues Resolved
+...............
+
+See the `PyMongo 4.3 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PYTHON-1824: https://jira.mongodb.org/browse/PYTHON-1824
+.. _PYTHON-2484: https://jira.mongodb.org/browse/PYTHON-2484
+.. _PYTHON-2970: https://jira.mongodb.org/browse/PYTHON-2970
+.. _PYTHON-3389: https://jira.mongodb.org/browse/PYTHON-3389
+.. _PyMongo 4.3 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=33425
+
+Changes in Version 4.2
+----------------------
+
+.. warning:: PyMongo 4.2 drops support for Python 3.6: Python 3.7+ is now required.
+
+PyMongo 4.2 brings a number of improvements including:
+
+- Support for MongoDB 6.0.
+- Support for the Queryable Encryption beta with MongoDB 6.0. Note that backwards-breaking
+  changes may be made before the final release.  See :ref:`automatic-queryable-client-side-encryption` for example usage.
+- Provisional (beta) support for :func:`pymongo.timeout` to apply a single timeout
+  to an entire block of pymongo operations. See :ref:`timeout-example` for examples.
+- Added the ``timeoutMS`` URI and keyword argument to :class:`~pymongo.mongo_client.MongoClient`.
+- Added the :attr:`pymongo.errors.PyMongoError.timeout` property which is ``True`` when
+  the error was caused by a timeout.
+- Added the ``check_exists`` argument to :meth:`~pymongo.database.Database.create_collection`
+  that when True (the default)  runs an additional ``listCollections`` command to verify that the
+  collection does not exist already.
+- Added the following key management APIs to :class:`~pymongo.encryption.ClientEncryption`:
+
+  - :meth:`~pymongo.encryption.ClientEncryption.get_key`
+  - :meth:`~pymongo.encryption.ClientEncryption.get_keys`
+  - :meth:`~pymongo.encryption.ClientEncryption.delete_key`
+  - :meth:`~pymongo.encryption.ClientEncryption.add_key_alt_name`
+  - :meth:`~pymongo.encryption.ClientEncryption.get_key_by_alt_name`
+  - :meth:`~pymongo.encryption.ClientEncryption.remove_key_alt_name`
+  - :meth:`~pymongo.encryption.ClientEncryption.rewrap_many_data_key`
+  - :class:`~pymongo.encryption.RewrapManyDataKeyResult`
+
+- Support for the ``crypt_shared`` library to replace ``mongocryptd`` using the new
+  ``crypt_shared_lib_path`` and ``crypt_shared_lib_required`` arguments to
+  :class:`~pymongo.encryption_options.AutoEncryptionOpts`.
+
+Bug fixes
+.........
+
+- Fixed a bug where :meth:`~pymongo.collection.Collection.estimated_document_count`
+  would fail with a "CommandNotSupportedOnView" error on views (`PYTHON-2885`_).
+- Fixed a bug where invalid UTF-8 strings could be passed as patterns for :class:`~bson.regex.Regex`
+  objects. :func:`bson.encode` now correctly raises :class:`bson.errors.InvalidStringData` (`PYTHON-3048`_).
+- Fixed a bug that caused ``AutoReconnect("connection pool paused")`` errors in the child
+  process after fork (`PYTHON-3257`_).
+- Fixed a bug where  :meth:`~pymongo.collection.Collection.count_documents` and
+  :meth:`~pymongo.collection.Collection.distinct` would fail in a transaction with
+  ``directConnection=True`` (`PYTHON-3333`_).
+- GridFS no longer uploads an incomplete files collection document after encountering an
+  error in the middle of an upload fork. This results in fewer
+  :class:`~gridfs.errors.CorruptGridFile` errors (`PYTHON-1552`_).
+- Renamed PyMongo's internal C extension methods to avoid crashing due to name conflicts
+  with mpi4py and other shared libraries (`PYTHON-2110`_).
+- Fixed tight CPU loop for network I/O when using PyOpenSSL (`PYTHON-3187`_).
+
+Unavoidable breaking changes
+............................
+
+- pymongocrypt 1.3.0 or later is now required for client side field level
+  encryption support.
+- :meth:`~pymongo.collection.Collection.estimated_document_count` now always uses
+  the `count`_ command. Due to an oversight in versions 5.0.0-5.0.8 of MongoDB,
+  the count command was not included in V1 of the :ref:`versioned-api-ref`.
+  Users of the Stable API with estimated_document_count are recommended to upgrade
+  their server version to 5.0.9+ or set :attr:`pymongo.server_api.ServerApi.strict`
+  to ``False`` to avoid encountering errors (`PYTHON-3167`_).
+- Removed generic typing from :class:`~pymongo.client_session.ClientSession` to improve
+  support for Pyright (`PYTHON-3283`_).
+- Added ``__all__`` to the bson, pymongo, and gridfs packages. This could be a breaking
+  change for apps that relied on ``from bson import *`` to import APIs not present in
+  ``__all__`` (`PYTHON-3311`_).
+
+.. _count: https://mongodb.com/docs/manual/reference/command/count/
+
+Issues Resolved
+...............
+
+See the `PyMongo 4.2 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PYTHON-3048: https://jira.mongodb.org/browse/PYTHON-3048
+.. _PYTHON-2885: https://jira.mongodb.org/browse/PYTHON-2885
+.. _PYTHON-3167: https://jira.mongodb.org/browse/PYTHON-3167
+.. _PYTHON-3257: https://jira.mongodb.org/browse/PYTHON-3257
+.. _PYTHON-3333: https://jira.mongodb.org/browse/PYTHON-3333
+.. _PYTHON-1552: https://jira.mongodb.org/browse/PYTHON-1552
+.. _PYTHON-2110: https://jira.mongodb.org/browse/PYTHON-2110
+.. _PYTHON-3283: https://jira.mongodb.org/browse/PYTHON-3283
+.. _PYTHON-3311: https://jira.mongodb.org/browse/PYTHON-3311
+.. _PYTHON-3187: https://jira.mongodb.org/browse/PYTHON-3187
+.. _PyMongo 4.2 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=33196
+.. _Queryable Encryption: automatic-queryable-client-side-encryption
+
+Changes in Version 4.1.1
+-------------------------
+
+Version 4.1.1 fixes a number of bugs:
+
+- Fixed a memory leak bug when calling :func:`~bson.decode_all` without a
+  ``codec_options`` argument (`PYTHON-3222`_).
+- Fixed a bug where :func:`~bson.decode_all` did not accept ``codec_options``
+  as a keyword argument (`PYTHON-3222`_).
+- Fixed an oversight where type markers (py.typed files) were not included
+  in our release distributions (`PYTHON-3214`_).
+- Fixed a bug where pymongo would raise a "NameError: name sys is not defined"
+  exception when attempting to parse a "mongodb+srv://" URI when the dnspython
+  dependency was not installed (`PYTHON-3198`_).
+
+Issues Resolved
+...............
+
+See the `PyMongo 4.1.1 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PYTHON-3198: https://jira.mongodb.org/browse/PYTHON-3198
+.. _PYTHON-3214: https://jira.mongodb.org/browse/PYTHON-3214
+.. _PYTHON-3222: https://jira.mongodb.org/browse/PYTHON-3222
+.. _PyMongo 4.1.1 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=33290
+
 Changes in Version 4.1
 ----------------------
 
+.. warning:: PyMongo 4.1 drops support for Python 3.6.0 and 3.6.1, Python 3.6.2+ is now required.
+
 PyMongo 4.1 brings a number of improvements including:
 
-- :meth:`pymongo.collection.Collection.update_one`,
-  :meth:`pymongo.collection.Collection.update_many`,
-  :meth:`pymongo.collection.Collection.delete_one`,
-  :meth:`pymongo.collection.Collection.delete_many`,
-  :meth:`pymongo.collection.Collection.aggregate`,
-  :meth:`pymongo.collection.Collection.find_one_and_delete`,
-  :meth:`pymongo.collection.Collection.find_one_and_replace`,
-  :meth:`pymongo.collection.Collection.find_one_and_update`,
-  :meth:`pymongo.collection.Collection.find`,
-  and :meth:`pymongo.collection.Collection.replace_one `all support a new
-  keyword argument ``let`` which is a map of parameter names and values.
+- Type Hinting support (formerly provided by `pymongo-stubs`_).  See :doc:`examples/type_hints` for more information.
+- Added support for the ``comment`` parameter to all helpers. For example see
+  :meth:`~pymongo.collection.Collection.insert_one`.
+- Added support for the ``let`` parameter to
+  :meth:`~pymongo.collection.Collection.update_one`,
+  :meth:`~pymongo.collection.Collection.update_many`,
+  :meth:`~pymongo.collection.Collection.delete_one`,
+  :meth:`~pymongo.collection.Collection.delete_many`,
+  :meth:`~pymongo.collection.Collection.replace_one`,
+  :meth:`~pymongo.collection.Collection.aggregate`,
+  :meth:`~pymongo.collection.Collection.find_one_and_delete`,
+  :meth:`~pymongo.collection.Collection.find_one_and_replace`,
+  :meth:`~pymongo.collection.Collection.find_one_and_update`,
+  :meth:`~pymongo.collection.Collection.find`,
+  :meth:`~pymongo.collection.Collection.find_one`,
+  and :meth:`~pymongo.collection.Collection.bulk_write`.
+  ``let`` is a map of parameter names and values.
   Parameters can then be accessed as variables in an aggregate expression
   context.
 - :meth:`~pymongo.collection.Collection.aggregate` now supports
   $merge and $out executing on secondaries on MongoDB >=5.0.
   aggregate() now always obeys the collection's :attr:`read_preference` on
   MongoDB >= 5.0.
-- :meth:`gridfs.GridOut.seek` now returns the new position in the file, to
+- :meth:`gridfs.grid_file.GridOut.seek` now returns the new position in the file, to
   conform to the behavior of :meth:`io.IOBase.seek`.
-
-Breaking Changes in 4.1
-.......................
-- Removed support for Python 3.6.0 and 3.6.1, Python 3.6.2+ is now required.
+- Improved reuse of implicit sessions (`PYTHON-2956`_).
 
 Bug fixes
 .........
 
-- Fixed a bug where the client could be unable to discover the new primary
-  after a simultaneous replica set election and reconfig (`PYTHON-2970`_).
-
-.. _PYTHON-2970: https://jira.mongodb.org/browse/PYTHON-2970
+- Fixed bug that would cause SDAM heartbeat timeouts and connection churn on
+  AWS Lambda and other FaaS environments (`PYTHON-3186`_).
+- Fixed bug where :class:`~pymongo.mongo_client.MongoClient`,
+  :class:`~pymongo.database.Database`, and :class:`~pymongo.collection.Collection`
+  mistakenly implemented :class:`typing.Iterable` (`PYTHON-3084`_).
 
 Issues Resolved
 ...............
@@ -45,6 +272,10 @@ See the `PyMongo 4.1 release notes in JIRA`_ for the list of resolved issues
 in this release.
 
 .. _PyMongo 4.1 release notes in JIRA: https://jira.mongodb.org/secure/ReleaseNote.jspa?projectId=10004&version=30619
+.. _PYTHON-2956: https://jira.mongodb.org/browse/PYTHON-2956
+.. _PYTHON-3084: https://jira.mongodb.org/browse/PYTHON-3084
+.. _PYTHON-3186: https://jira.mongodb.org/browse/PYTHON-3186
+.. _pymongo-stubs: https://github.com/mongodb-labs/pymongo-stubs
 
 Changes in Version 4.0
 ----------------------
@@ -52,6 +283,15 @@ Changes in Version 4.0
 .. warning:: PyMongo 4.0 drops support for Python 2.7, 3.4, and 3.5.
 
 .. warning:: PyMongo 4.0 drops support for MongoDB 2.6, 3.0, 3.2, and 3.4.
+
+.. warning:: PyMongo 4.0 changes the default value of the ``directConnection`` URI option and
+  keyword argument to :class:`~pymongo.mongo_client.MongoClient`
+  to ``False`` instead of ``None``, allowing for the automatic
+  discovery of replica sets. This means that if you
+  want a direct connection to a single server you must pass
+  ``directConnection=True`` as a URI option or keyword argument.
+  For more details, see the relevant section of the PyMongo 4.x migration
+  guide: :ref:`pymongo4-migration-direct-connection`.
 
 PyMongo 4.0 brings a number of improvements as well as some backward breaking
 changes. For example, all APIs deprecated in PyMongo 3.X have been removed.
@@ -178,9 +418,9 @@ Breaking Changes in 4.0
   :class:`~bson.dbref.DBRef`.
 - The "tls" install extra is no longer necessary or supported and will be
   ignored by pip.
-- ``tz_aware``, an argument for :class:`~bson.json_util.JSONOptions`,
-  now defaults to ``False`` instead of ``True``. ``json_util.loads`` now
-  decodes datetime as naive by default.
+- The ``tz_aware`` argument to :class:`~bson.json_util.JSONOptions`
+  now defaults to ``False`` instead of ``True``. :meth:`bson.json_util.loads` now
+  decodes datetime as naive by default. See :ref:`tz_aware_default_change` for more info.
 - ``directConnection`` URI option and keyword argument to :class:`~pymongo.mongo_client.MongoClient`
   defaults to ``False`` instead of ``None``, allowing for the automatic
   discovery of replica sets. This means that if you
@@ -227,7 +467,7 @@ Breaking Changes in 4.0
   :attr:`~pymongo.mongo_client.MongoClient.address` which can change.
 - Removed the `disable_md5` parameter for :class:`~gridfs.GridFSBucket` and
   :class:`~gridfs.GridFS`. See :ref:`removed-gridfs-checksum` for details.
-- PyMongoCrypt 1.2.0 or later is now required for client side field level
+- pymongocrypt 1.2.0 or later is now required for client side field level
   encryption support.
 
 Notable improvements
@@ -266,7 +506,7 @@ Changes in Version 3.12.0
 .. warning:: PyMongo now allows insertion of documents with keys that include
    dots ('.') or start with dollar signs ('$').
 
-- PyMongoCrypt 1.1.0 or later is now required for client side field level
+- pymongocrypt 1.1.0 or later is now required for client side field level
   encryption support.
 - Iterating over :class:`gridfs.grid_file.GridOut` now moves through
   the file line by line instead of chunk by chunk, and does not
@@ -340,7 +580,7 @@ Deprecations
 .. _PYTHON-2466: https://jira.mongodb.org/browse/PYTHON-2466
 .. _PYTHON-1690: https://jira.mongodb.org/browse/PYTHON-1690
 .. _PYTHON-2472: https://jira.mongodb.org/browse/PYTHON-2472
-.. _profile command: https://docs.mongodb.com/manual/reference/command/profile/
+.. _profile command: https://mongodb.com/docs/manual/reference/command/profile/
 
 Issues Resolved
 ...............
@@ -512,7 +752,7 @@ Unavoidable breaking changes:
   now always raises the following error:
   ``InvalidOperation: GridFS does not support multi-document transactions``
 
-.. _validate command: https://docs.mongodb.com/manual/reference/command/validate/
+.. _validate command: https://mongodb.com/docs/manual/reference/command/validate/
 
 Issues Resolved
 ...............
@@ -677,8 +917,8 @@ Changes in Version 3.8.0
 
 .. warning:: PyMongo no longer supports Python 2.6. RHEL 6 users should install
   Python 2.7 or newer from `Red Hat Software Collections
-  <https://www.softwarecollections.org>`_. CentOS 6 users should install Python
-  2.7 or newer from `SCL
+  <https://developers.redhat.com/products/softwarecollections/overview>`_.
+  CentOS 6 users should install Python 2.7 or newer from `SCL
   <https://wiki.centos.org/AdditionalResources/Repositories/SCL>`_
 
 .. warning:: PyMongo no longer supports PyPy3 versions older than 3.5. Users
@@ -860,7 +1100,7 @@ Deprecations:
 - Deprecated :meth:`pymongo.collection.Collection.count` and
   :meth:`pymongo.cursor.Cursor.count`. These two methods use the `count`
   command and `may or may not be accurate
-  <https://docs.mongodb.com/manual/reference/command/count/#behavior>`_,
+  <https://mongodb.com/docs/manual/reference/command/count/#behavior>`_,
   depending on the options used and connected MongoDB topology. Use
   :meth:`~pymongo.collection.Collection.count_documents` instead.
 - Deprecated the snapshot option of :meth:`~pymongo.collection.Collection.find`
@@ -1076,7 +1316,7 @@ Changes and Deprecations:
 - Deprecated the MongoClient option `socketKeepAlive`. It now defaults to true
   and disabling it is not recommended, see `does TCP keepalive time affect
   MongoDB Deployments?
-  <https://docs.mongodb.com/manual/faq/diagnostics/#does-tcp-keepalive-time-affect-mongodb-deployments->`_
+  <https://mongodb.com/docs/manual/faq/diagnostics/#does-tcp-keepalive-time-affect-mongodb-deployments->`_
 - Deprecated :meth:`~pymongo.collection.Collection.initialize_ordered_bulk_op`,
   :meth:`~pymongo.collection.Collection.initialize_unordered_bulk_op`, and
   :class:`~pymongo.bulk.BulkOperationBuilder`. Use
@@ -2372,7 +2612,7 @@ Important New Features:
 - Support for mongos failover.
 - A new :meth:`~pymongo.collection.Collection.aggregate` method to support
   MongoDB's new `aggregation framework
-  <http://docs.mongodb.org/manual/applications/aggregation/>`_.
+  <http://mongodb.com/docs/manual/applications/aggregation/>`_.
 - Support for legacy Java and C# byte order when encoding and decoding UUIDs.
 - Support for connecting directly to an arbiter.
 
@@ -2380,7 +2620,7 @@ Important New Features:
 
     Starting with MongoDB 2.2 the getLastError command requires authentication
     when the server's `authentication features
-    <http://www.mongodb.org/display/DOCS/Security+and+Authentication>`_ are enabled.
+    <https://www.mongodb.com/docs/manual/core/authentication/>`_ are enabled.
     Changes to PyMongo were required to support this behavior change. Users of
     authentication must upgrade to PyMongo 2.3 (or newer) for "safe" write operations
     to function correctly.
@@ -2894,7 +3134,7 @@ highlights is `here
 - added support for :class:`~pymongo.cursor.Cursor.max_scan`.
 - raise :class:`~gridfs.errors.FileExists` exception when creating a
   duplicate GridFS file.
-- use `y2038 <http://code.google.com/p/y2038/>`_ for time handling in
+- use `y2038 <https://github.com/evalEmpire/y2038/>`_ for time handling in
   the C extension - eliminates 2038 problems when extension is
   installed.
 - added `sort` parameter to
@@ -3279,9 +3519,3 @@ Changes in Version 0.9.7
   :class:`~pymongo.collection.Collection` names
 - add version as :attr:`pymongo.version`
 - add ``--no_ext`` command line option to *setup.py*
-
-.. toctree::
-   :hidden:
-
-   python3
-   examples/gevent

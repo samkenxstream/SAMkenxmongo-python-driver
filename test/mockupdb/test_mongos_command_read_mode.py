@@ -16,7 +16,7 @@ import itertools
 import unittest
 
 from mockupdb import MockupDB, OpMsg, going
-from operations import operations
+from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient, ReadPreference
 from pymongo.read_preferences import (

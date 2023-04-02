@@ -36,7 +36,7 @@ from urllib.parse import unquote_plus
 
 from bson import SON
 from bson.binary import UuidRepresentation
-from bson.codec_options import CodecOptions, TypeRegistry
+from bson.codec_options import CodecOptions, DatetimeConversion, TypeRegistry
 from bson.raw_bson import RawBSONDocument
 from pymongo.auth import MECHANISMS
 from pymongo.compression_support import (
@@ -63,7 +63,7 @@ MAX_WRITE_BATCH_SIZE = 1000
 # What this version of PyMongo supports.
 MIN_SUPPORTED_SERVER_VERSION = "3.6"
 MIN_SUPPORTED_WIRE_VERSION = 6
-MAX_SUPPORTED_WIRE_VERSION = 14
+MAX_SUPPORTED_WIRE_VERSION = 17
 
 # Frequency to call hello on servers, in seconds.
 HEARTBEAT_FREQUENCY = 10
@@ -339,6 +339,15 @@ def validate_timeout_or_none_or_zero(option: Any, value: Any) -> Optional[float]
     return validate_positive_float(option, value) / 1000.0
 
 
+def validate_timeoutms(option: Any, value: Any) -> Optional[float]:
+    """Validates a timeout specified in milliseconds returning
+    a value in floating point seconds.
+    """
+    if value is None:
+        return None
+    return validate_positive_float_or_zero(option, value) / 1000.0
+
+
 def validate_max_staleness(option: str, value: Any) -> int:
     """Validates maxStalenessSeconds according to the Max Staleness Spec."""
     if value == -1 or value == "-1":
@@ -448,7 +457,15 @@ def validate_document_class(
     option: str, value: Any
 ) -> Union[Type[MutableMapping], Type[RawBSONDocument]]:
     """Validate the document_class option."""
-    if not issubclass(value, (abc.MutableMapping, RawBSONDocument)):
+    # issubclass can raise TypeError for generic aliases like SON[str, Any].
+    # In that case we can use the base class for the comparison.
+    is_mapping = False
+    try:
+        is_mapping = issubclass(value, abc.MutableMapping)
+    except TypeError:
+        if hasattr(value, "__origin__"):
+            is_mapping = issubclass(value.__origin__, abc.MutableMapping)
+    if not is_mapping and not issubclass(value, RawBSONDocument):
         raise TypeError(
             "%s must be dict, bson.son.SON, "
             "bson.raw_bson.RawBSONDocument, or a "
@@ -603,6 +620,21 @@ def validate_auto_encryption_opts_or_none(option: Any, value: Any) -> Optional[A
     return value
 
 
+def validate_datetime_conversion(option: Any, value: Any) -> Optional[DatetimeConversion]:
+    """Validate a DatetimeConversion string."""
+    if value is None:
+        return DatetimeConversion.DATETIME
+
+    if isinstance(value, str):
+        if value.isdigit():
+            return DatetimeConversion(int(value))
+        return DatetimeConversion[value]
+    elif isinstance(value, int):
+        return DatetimeConversion(value)
+
+    raise TypeError("%s must be a str or int representing DatetimeConversion" % (option,))
+
+
 # Dictionary where keys are the names of public URI options, and values
 # are lists of aliases for that option.
 URI_OPTIONS_ALIAS_MAP: Dict[str, List[str]] = {
@@ -650,6 +682,7 @@ URI_OPTIONS_VALIDATOR_MAP: Dict[str, Callable[[Any, Any], Any]] = {
     "zlibcompressionlevel": validate_zlib_compression_level,
     "srvservicename": validate_string,
     "srvmaxhosts": validate_non_negative_integer,
+    "timeoutms": validate_timeoutms,
 }
 
 # Dictionary where keys are the names of URI options specific to pymongo,
@@ -666,6 +699,7 @@ NONSPEC_OPTIONS_VALIDATOR_MAP: Dict[str, Callable[[Any, Any], Any]] = {
     "uuidrepresentation": validate_uuid_representation,
     "waitqueuemultiple": validate_non_negative_integer_or_none,
     "waitqueuetimeoutms": validate_timeout_or_none,
+    "datetime_conversion": validate_datetime_conversion,
 }
 
 # Dictionary where keys are the names of keyword-only options for the
@@ -784,6 +818,18 @@ def get_validated_options(
     return validated_options
 
 
+def _esc_coll_name(encrypted_fields, name):
+    return encrypted_fields.get("escCollection", f"enxcol_.{name}.esc")
+
+
+def _ecc_coll_name(encrypted_fields, name):
+    return encrypted_fields.get("eccCollection", f"enxcol_.{name}.ecc")
+
+
+def _ecoc_coll_name(encrypted_fields, name):
+    return encrypted_fields.get("ecocCollection", f"enxcol_.{name}.ecoc")
+
+
 # List of write-concern-related options.
 WRITE_CONCERN_OPTIONS = frozenset(["w", "wtimeout", "wtimeoutms", "fsync", "j", "journal"])
 
@@ -802,7 +848,6 @@ class BaseObject(object):
         write_concern: WriteConcern,
         read_concern: ReadConcern,
     ) -> None:
-
         if not isinstance(codec_options, CodecOptions):
             raise TypeError("codec_options must be an instance of bson.codec_options.CodecOptions")
         self.__codec_options = codec_options

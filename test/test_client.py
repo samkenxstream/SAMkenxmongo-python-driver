@@ -23,10 +23,11 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
-from typing import Type, no_type_check
+from typing import Iterable, Type, no_type_check
 
 sys.path[0:0] = [""]
 
@@ -64,7 +65,12 @@ from test.utils import (
 
 import pymongo
 from bson import encode
-from bson.codec_options import CodecOptions, TypeEncoder, TypeRegistry
+from bson.codec_options import (
+    CodecOptions,
+    DatetimeConversion,
+    TypeEncoder,
+    TypeRegistry,
+)
 from bson.son import SON
 from bson.tz_util import utc
 from pymongo import event_loggers, message, monitoring
@@ -210,10 +216,26 @@ class ClientUnitTest(unittest.TestCase):
         self.assertIn("has no attribute '_does_not_exist'", str(context.exception))
 
     def test_iteration(self):
-        def iterate():
-            [a for a in self.client]
-
-        self.assertRaises(TypeError, iterate)
+        client = self.client
+        if "PyPy" in sys.version and sys.version_info < (3, 8, 15):
+            msg = "'NoneType' object is not callable"
+        else:
+            msg = "'MongoClient' object is not iterable"
+        # Iteration fails
+        with self.assertRaisesRegex(TypeError, msg):
+            for _ in client:  # type: ignore[misc] # error: "None" not callable  [misc]
+                break
+        # Index fails
+        with self.assertRaises(TypeError):
+            _ = client[0]
+        # next fails
+        with self.assertRaisesRegex(TypeError, "'MongoClient' object is not iterable"):
+            _ = next(client)
+        # .next() fails
+        with self.assertRaisesRegex(TypeError, "'MongoClient' object is not iterable"):
+            _ = client.next()
+        # Do not implement typing.Iterable.
+        self.assertNotIsInstance(client, Iterable)
 
     def test_get_default_database(self):
         c = rs_or_single_client(
@@ -369,14 +391,17 @@ class ClientUnitTest(unittest.TestCase):
         # Ensure codec options are passed in correctly
         uuid_representation_label = "javaLegacy"
         unicode_decode_error_handler = "ignore"
+        datetime_conversion = "DATETIME_CLAMP"
         uri = (
             "mongodb://%s:%d/foo?tz_aware=true&uuidrepresentation="
             "%s&unicode_decode_error_handler=%s"
+            "&datetime_conversion=%s"
             % (
                 client_context.host,
                 client_context.port,
                 uuid_representation_label,
                 unicode_decode_error_handler,
+                datetime_conversion,
             )
         )
         c = MongoClient(uri, connect=False)
@@ -386,6 +411,17 @@ class ClientUnitTest(unittest.TestCase):
             c.codec_options.uuid_representation, _UUID_REPRESENTATIONS[uuid_representation_label]
         )
         self.assertEqual(c.codec_options.unicode_decode_error_handler, unicode_decode_error_handler)
+        self.assertEqual(
+            c.codec_options.datetime_conversion, DatetimeConversion[datetime_conversion]
+        )
+
+        # Change the passed datetime_conversion to a number and re-assert.
+        uri = uri.replace(datetime_conversion, f"{int(DatetimeConversion[datetime_conversion])}")
+        c = MongoClient(uri, connect=False)
+
+        self.assertEqual(
+            c.codec_options.datetime_conversion, DatetimeConversion[datetime_conversion]
+        )
 
     def test_uri_option_precedence(self):
         # Ensure kwarg options override connection string options.
@@ -755,6 +791,10 @@ class TestClient(IntegrationTest):
         self.assertIsInstance(cursor, CommandCursor)
         helper_docs = list(cursor)
         self.assertTrue(len(helper_docs) > 0)
+        # sizeOnDisk can change between calls.
+        for doc_list in (helper_docs, cmd_docs):
+            for doc in doc_list:
+                doc.pop("sizeOnDisk", None)
         self.assertEqual(helper_docs, cmd_docs)
         for doc in helper_docs:
             self.assertIs(type(doc), dict)
@@ -1579,7 +1619,6 @@ class TestClient(IntegrationTest):
         with self.assertRaises(ConfigurationError):
             MongoClient(["host1", "host2"], directConnection=True)
 
-    @unittest.skipIf(sys.platform.startswith("java"), "Jython does not support gc.get_objects")
     @unittest.skipIf("PyPy" in sys.version, "PYTHON-2927 fails often on PyPy")
     def test_continuous_network_errors(self):
         def server_description_count():
@@ -1595,7 +1634,7 @@ class TestClient(IntegrationTest):
         gc.collect()
         with client_knobs(min_heartbeat_interval=0.003):
             client = MongoClient(
-                "invalid:27017", heartbeatFrequencyMS=3, serverSelectionTimeoutMS=100
+                "invalid:27017", heartbeatFrequencyMS=3, serverSelectionTimeoutMS=150
             )
             initial_count = server_description_count()
             self.addCleanup(client.close)
@@ -1605,8 +1644,9 @@ class TestClient(IntegrationTest):
             final_count = server_description_count()
             # If a bug like PYTHON-2433 is reintroduced then too many
             # ServerDescriptions will be kept alive and this test will fail:
-            # AssertionError: 4 != 22 within 5 delta (18 difference)
-            self.assertAlmostEqual(initial_count, final_count, delta=10)
+            # AssertionError: 19 != 46 within 15 delta (27 difference)
+            # On Python 3.11 we seem to get more of a delta.
+            self.assertAlmostEqual(initial_count, final_count, delta=20)
 
     @client_context.require_failCommand_fail_point
     def test_network_error_message(self):
@@ -1616,6 +1656,7 @@ class TestClient(IntegrationTest):
         with self.fail_point(
             {"mode": {"times": 1}, "data": {"closeConnection": True, "failCommands": ["find"]}}
         ):
+            assert client.address is not None
             expected = "%s:%s: " % client.address
             with self.assertRaisesRegex(AutoReconnect, expected):
                 client.pymongo_test.test.find_one({})
@@ -1671,6 +1712,44 @@ class TestClient(IntegrationTest):
             "mongodb+srv://test1.test.build.10gen.cc/?srvMaxHosts=1", srvmaxhosts=2
         )
         self.assertEqual(len(client.topology_description.server_descriptions()), 2)
+
+    @unittest.skipIf(_HAVE_DNSPYTHON, "dnspython must not be installed")
+    def test_srv_no_dnspython_error(self):
+        with self.assertRaisesRegex(ConfigurationError, 'The "dnspython" module must be'):
+            MongoClient("mongodb+srv://test1.test.build.10gen.cc/")
+
+    @unittest.skipIf(
+        client_context.load_balancer or client_context.serverless,
+        "loadBalanced clients do not run SDAM",
+    )
+    @unittest.skipIf(sys.platform == "win32", "Windows does not support SIGSTOP")
+    def test_sigstop_sigcont(self):
+        test_dir = os.path.dirname(os.path.realpath(__file__))
+        script = os.path.join(test_dir, "sigstop_sigcont.py")
+        p = subprocess.Popen(
+            [sys.executable, script, client_context.uri],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.addCleanup(p.wait, timeout=1)
+        self.addCleanup(p.kill)
+        time.sleep(1)
+        # Stop the child, sleep for twice the streaming timeout
+        # (heartbeatFrequencyMS + connectTimeoutMS), and restart.
+        os.kill(p.pid, signal.SIGSTOP)
+        time.sleep(2)
+        os.kill(p.pid, signal.SIGCONT)
+        time.sleep(0.5)
+        # Tell the script to exit gracefully.
+        outs, _ = p.communicate(input=b"q\n", timeout=10)
+        self.assertTrue(outs)
+        log_output = outs.decode("utf-8")
+        self.assertIn("TEST STARTED", log_output)
+        self.assertIn("ServerHeartbeatStartedEvent", log_output)
+        self.assertIn("ServerHeartbeatSucceededEvent", log_output)
+        self.assertIn("TEST COMPLETED", log_output)
+        self.assertNotIn("ServerHeartbeatFailedEvent", log_output)
 
 
 class TestExhaustCursor(IntegrationTest):

@@ -4,8 +4,8 @@ import re
 import sys
 import warnings
 
-if sys.version_info[:3] < (3, 6, 2):
-    raise RuntimeError("Python version >= 3.6.2 required.")
+if sys.version_info[:3] < (3, 7):
+    raise RuntimeError("Python version >= 3.7 required.")
 
 
 # Hack to silence atexit traceback in some Python versions
@@ -34,7 +34,10 @@ except ImportError:
     except ImportError:
         _HAVE_SPHINX = False
 
-version = "4.1.0.dev0"
+version_ns = {}
+with open("pymongo/_version.py") as fp:
+    exec(fp.read(), version_ns)
+version = version_ns["__version__"]
 
 f = open("README.rst")
 try:
@@ -255,12 +258,7 @@ ext_modules = [
     Extension(
         "bson._cbson",
         include_dirs=["bson"],
-        sources=[
-            "bson/_cbsonmodule.c",
-            "bson/time64.c",
-            "bson/buffer.c",
-            "bson/encoding_helpers.c",
-        ],
+        sources=["bson/_cbsonmodule.c", "bson/time64.c", "bson/buffer.c"],
     ),
     Extension(
         "pymongo._cmessage",
@@ -280,13 +278,16 @@ if sys.platform in ("win32", "darwin"):
     # https://www.pyopenssl.org/en/stable/api/ssl.html#OpenSSL.SSL.Context.set_default_verify_paths
     pyopenssl_reqs.append("certifi")
 
+aws_reqs = ["pymongo-auth-aws<2.0.0"]
+
 extras_require = {
-    "encryption": ["pymongocrypt>=1.2.0,<2.0.0"],
+    "encryption": ["pymongocrypt>=1.5.0,<2.0.0"] + aws_reqs,
     "ocsp": pyopenssl_reqs,
     "snappy": ["python-snappy"],
     "zstd": ["zstandard"],
-    "aws": ["pymongo-auth-aws<2.0.0"],
-    "srv": ["dnspython>=1.16.0,<3.0.0"],
+    "aws": aws_reqs,
+    "srv": [],  # PYTHON-3423 Removed in 4.3 but kept here to avoid pip warnings.
+    "tls": [],  # PYTHON-2133 Removed in 4.0 but kept here to avoid pip warnings.
 }
 
 # GSSAPI extras
@@ -295,7 +296,7 @@ if sys.platform == "win32":
 else:
     extras_require["gssapi"] = ["pykerberos"]
 
-extra_opts = {"packages": ["bson", "pymongo", "gridfs"]}
+extra_opts = {}
 
 if "--no_ext" in sys.argv:
     sys.argv.remove("--no_ext")
@@ -319,9 +320,9 @@ setup(
     author="The MongoDB Python Team",
     url="http://github.com/mongodb/mongo-python-driver",
     keywords=["mongo", "mongodb", "pymongo", "gridfs", "bson"],
-    install_requires=[],
+    install_requires=["dnspython>=1.16.0,<3.0.0"],
     license="Apache License, Version 2.0",
-    python_requires=">=3.6.2",
+    python_requires=">=3.7",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
@@ -331,16 +332,23 @@ setup(
         "Operating System :: POSIX",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: Implementation :: CPython",
         "Programming Language :: Python :: Implementation :: PyPy",
         "Topic :: Database",
+        "Typing :: Typed",
     ],
     cmdclass={"build_ext": custom_build_ext, "doc": doc, "test": test},
     extras_require=extras_require,
+    packages=["bson", "pymongo", "gridfs"],
+    package_data={
+        "bson": ["py.typed", "*.pyi"],
+        "pymongo": ["py.typed", "*.pyi"],
+        "gridfs": ["py.typed", "*.pyi"],
+    },
     **extra_opts
 )

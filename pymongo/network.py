@@ -21,7 +21,7 @@ import struct
 import time
 
 from bson import _decode_all_selective
-from pymongo import helpers, message
+from pymongo import _csot, helpers, message, ssl_support
 from pymongo.common import MAX_MESSAGE_SIZE
 from pymongo.compression_support import _NO_COMPRESSION, decompress
 from pymongo.errors import (
@@ -59,6 +59,7 @@ def command(
     unacknowledged=False,
     user_fields=None,
     exhaust_allowed=False,
+    write_concern=None,
 ):
     """Execute a command over the socket, or raise socket.error.
 
@@ -114,6 +115,11 @@ def command(
 
     if client and client._encrypter and not client._encrypter._bypass_auto_encryption:
         spec = orig = client._encrypter.encrypt(dbname, spec, codec_options)
+
+    # Support CSOT
+    if client:
+        sock_info.apply_timeout(client, spec)
+    _csot.apply_write_concern(spec, write_concern)
 
     if use_op_msg:
         flags = _OpMsg.MORE_TO_COME if unacknowledged else 0
@@ -198,11 +204,14 @@ _UNPACK_COMPRESSION_HEADER = struct.Struct("<iiB").unpack
 
 def receive_message(sock_info, request_id, max_message_size=MAX_MESSAGE_SIZE):
     """Receive a raw BSON message or raise socket.error."""
-    timeout = sock_info.sock.gettimeout()
-    if timeout:
-        deadline = time.monotonic() + timeout
+    if _csot.get_timeout():
+        deadline = _csot.get_deadline()
     else:
-        deadline = None
+        timeout = sock_info.sock.gettimeout()
+        if timeout:
+            deadline = time.monotonic() + timeout
+        else:
+            deadline = None
     # Ignore the response's request id.
     length, _, response_to, op_code = _UNPACK_HEADER(
         _receive_data_on_socket(sock_info, 16, deadline)
@@ -244,6 +253,7 @@ def wait_for_read(sock_info, deadline):
     # Only Monitor connections can be cancelled.
     if context:
         sock = sock_info.sock
+        timed_out = False
         while True:
             # SSLSocket can have buffered data which won't be caught by select.
             if hasattr(sock, "pending") and sock.pending() > 0:
@@ -252,7 +262,13 @@ def wait_for_read(sock_info, deadline):
                 # Wait up to 500ms for the socket to become readable and then
                 # check for cancellation.
                 if deadline:
-                    timeout = max(min(deadline - time.monotonic(), _POLL_TIMEOUT), 0.001)
+                    remaining = deadline - time.monotonic()
+                    # When the timeout has expired perform one final check to
+                    # see if the socket is readable. This helps avoid spurious
+                    # timeouts on AWS Lambda and other FaaS environments.
+                    if remaining <= 0:
+                        timed_out = True
+                    timeout = max(min(remaining, _POLL_TIMEOUT), 0)
                 else:
                     timeout = _POLL_TIMEOUT
                 readable = sock_info.socket_checker.select(sock, read=True, timeout=timeout)
@@ -260,8 +276,12 @@ def wait_for_read(sock_info, deadline):
                 raise _OperationCancelled("hello cancelled")
             if readable:
                 return
-            if deadline and time.monotonic() > deadline:
+            if timed_out:
                 raise socket.timeout("timed out")
+
+
+# Errors raised by sockets (and TLS sockets) when in non-blocking mode.
+BLOCKING_IO_ERRORS = (BlockingIOError,) + ssl_support.BLOCKING_IO_ERRORS
 
 
 def _receive_data_on_socket(sock_info, length, deadline):
@@ -271,7 +291,14 @@ def _receive_data_on_socket(sock_info, length, deadline):
     while bytes_read < length:
         try:
             wait_for_read(sock_info, deadline)
+            # CSOT: Update timeout. When the timeout has expired perform one
+            # final non-blocking recv. This helps avoid spurious timeouts when
+            # the response is actually already buffered on the client.
+            if _csot.get_timeout():
+                sock_info.set_socket_timeout(max(deadline - time.monotonic(), 0))
             chunk_length = sock_info.sock.recv_into(mv[bytes_read:])
+        except BLOCKING_IO_ERRORS:
+            raise socket.timeout("timed out")
         except (IOError, OSError) as exc:  # noqa: B014
             if _errno_from_exception(exc) == errno.EINTR:
                 continue

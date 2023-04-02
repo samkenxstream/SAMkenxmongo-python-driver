@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, Mapping, Optional, Union
 from bson import _bson_to_dict
 from bson.raw_bson import RawBSONDocument
 from bson.timestamp import Timestamp
-from pymongo import common
+from pymongo import _csot, common
 from pymongo.aggregation import (
     _CollectionAggregationCommand,
     _DatabaseAggregationCommand,
@@ -57,7 +57,6 @@ _RESUMABLE_GETMORE_ERRORS = frozenset(
         13388,  # StaleConfig
         234,  # RetryChangeStream
         133,  # FailedToSatisfyReadPreference
-        216,  # ElectionInProgress
     ]
 )
 
@@ -69,6 +68,19 @@ if TYPE_CHECKING:
     from pymongo.mongo_client import MongoClient
 
 
+def _resumable(exc: PyMongoError) -> bool:
+    """Return True if given a resumable change stream error."""
+    if isinstance(exc, (ConnectionFailure, CursorNotFound)):
+        return True
+    if isinstance(exc, OperationFailure):
+        if exc._max_wire_version is None:
+            return False
+        return (
+            exc._max_wire_version >= 9 and exc.has_error_label("ResumableChangeStreamError")
+        ) or (exc._max_wire_version < 9 and exc.code in _RESUMABLE_GETMORE_ERRORS)
+    return False
+
+
 class ChangeStream(Generic[_DocumentType]):
     """The internal abstract base class for change stream cursors.
 
@@ -78,7 +90,7 @@ class ChangeStream(Generic[_DocumentType]):
     :meth:`pymongo.mongo_client.MongoClient.watch` instead.
 
     .. versionadded:: 3.6
-    .. seealso:: The MongoDB documentation on `changeStreams <https://docs.mongodb.com/manual/changeStreams/>`_.
+    .. seealso:: The MongoDB documentation on `changeStreams <https://mongodb.com/docs/manual/changeStreams/>`_.
     """
 
     def __init__(
@@ -96,6 +108,8 @@ class ChangeStream(Generic[_DocumentType]):
         session: Optional["ClientSession"],
         start_after: Optional[Mapping[str, Any]],
         comment: Optional[Any] = None,
+        full_document_before_change: Optional[str] = None,
+        show_expanded_events: Optional[bool] = None,
     ) -> None:
         if pipeline is None:
             pipeline = []
@@ -118,6 +132,7 @@ class ChangeStream(Generic[_DocumentType]):
 
         self._pipeline = copy.deepcopy(pipeline)
         self._full_document = full_document
+        self._full_document_before_change = full_document_before_change
         self._uses_start_after = start_after is not None
         self._uses_resume_after = resume_after is not None
         self._resume_token = copy.deepcopy(start_after or resume_after)
@@ -127,6 +142,9 @@ class ChangeStream(Generic[_DocumentType]):
         self._start_at_operation_time = start_at_operation_time
         self._session = session
         self._comment = comment
+        self._closed = False
+        self._timeout = self._target._timeout
+        self._show_expanded_events = show_expanded_events
         # Initialize cursor.
         self._cursor = self._create_cursor()
 
@@ -147,6 +165,9 @@ class ChangeStream(Generic[_DocumentType]):
         if self._full_document is not None:
             options["fullDocument"] = self._full_document
 
+        if self._full_document_before_change is not None:
+            options["fullDocumentBeforeChange"] = self._full_document_before_change
+
         resume_token = self.resume_token
         if resume_token is not None:
             if self._uses_start_after:
@@ -156,6 +177,10 @@ class ChangeStream(Generic[_DocumentType]):
 
         if self._start_at_operation_time is not None:
             options["startAtOperationTime"] = self._start_at_operation_time
+
+        if self._show_expanded_events:
+            options["showExpandedEvents"] = self._show_expanded_events
+
         return options
 
     def _command_options(self):
@@ -211,6 +236,7 @@ class ChangeStream(Generic[_DocumentType]):
             explicit_session,
             result_processor=self._process_result,
             comment=self._comment,
+            show_expanded_events=self._show_expanded_events,
         )
         return self._client._retryable_read(
             cmd.get_cursor, self._target._read_preference_for(session), session
@@ -230,6 +256,7 @@ class ChangeStream(Generic[_DocumentType]):
 
     def close(self) -> None:
         """Close this ChangeStream."""
+        self._closed = True
         self._cursor.close()
 
     def __iter__(self) -> "ChangeStream[_DocumentType]":
@@ -244,6 +271,7 @@ class ChangeStream(Generic[_DocumentType]):
         """
         return copy.deepcopy(self._resume_token)
 
+    @_csot.apply
     def next(self) -> _DocumentType:
         """Advance the cursor.
 
@@ -294,8 +322,9 @@ class ChangeStream(Generic[_DocumentType]):
 
         .. versionadded:: 3.8
         """
-        return self._cursor.alive
+        return not self._closed
 
+    @_csot.apply
     def try_next(self) -> Optional[_DocumentType]:
         """Advance the cursor without blocking indefinitely.
 
@@ -328,23 +357,31 @@ class ChangeStream(Generic[_DocumentType]):
 
         .. versionadded:: 3.8
         """
+        if not self._closed and not self._cursor.alive:
+            self._resume()
+
         # Attempt to get the next change with at most one getMore and at most
         # one resume attempt.
         try:
-            change = self._cursor._try_next(True)
-        except (ConnectionFailure, CursorNotFound):
-            self._resume()
-            change = self._cursor._try_next(False)
-        except OperationFailure as exc:
-            if exc._max_wire_version is None:
-                raise
-            is_resumable = (
-                exc._max_wire_version >= 9 and exc.has_error_label("ResumableChangeStreamError")
-            ) or (exc._max_wire_version < 9 and exc.code in _RESUMABLE_GETMORE_ERRORS)
-            if not is_resumable:
-                raise
-            self._resume()
-            change = self._cursor._try_next(False)
+            try:
+                change = self._cursor._try_next(True)
+            except PyMongoError as exc:
+                if not _resumable(exc):
+                    raise
+                self._resume()
+                change = self._cursor._try_next(False)
+        except PyMongoError as exc:
+            # Close the stream after a fatal error.
+            if not _resumable(exc) and not exc.timeout:
+                self.close()
+            raise
+        except Exception:
+            self.close()
+            raise
+
+        # Check if the cursor was invalidated.
+        if not self._cursor.alive:
+            self._closed = True
 
         # If no changes are available.
         if change is None:

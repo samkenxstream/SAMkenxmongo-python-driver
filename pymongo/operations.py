@@ -13,21 +13,26 @@
 # limitations under the License.
 
 """Operation class definitions."""
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Tuple, Union
 
+from bson.raw_bson import RawBSONDocument
 from pymongo import helpers
 from pymongo.collation import validate_collation_or_none
 from pymongo.common import validate_boolean, validate_is_mapping, validate_list
 from pymongo.helpers import _gen_index_name, _index_document, _index_list
-from pymongo.typings import _CollationIn, _DocumentIn, _Pipeline
+from pymongo.typings import _CollationIn, _DocumentType, _Pipeline
+
+# Hint supports index name, "myIndex", or list of either strings or index pairs: [('x', 1), ('y', -1), 'z'']
+_IndexList = Sequence[Union[str, Tuple[str, Union[int, str, Mapping[str, Any]]]]]
+_IndexKeyHint = Union[str, _IndexList]
 
 
-class InsertOne(object):
+class InsertOne(Generic[_DocumentType]):
     """Represents an insert_one operation."""
 
     __slots__ = ("_doc",)
 
-    def __init__(self, document: _DocumentIn) -> None:
+    def __init__(self, document: Union[_DocumentType, RawBSONDocument]) -> None:
         """Create an InsertOne instance.
 
         For use with :meth:`~pymongo.collection.Collection.bulk_write`.
@@ -52,10 +57,6 @@ class InsertOne(object):
 
     def __ne__(self, other: Any) -> bool:
         return not self == other
-
-
-_IndexList = Sequence[Tuple[str, Union[int, str, Mapping[str, Any]]]]
-_IndexKeyHint = Union[str, _IndexList]
 
 
 class DeleteOne(object):
@@ -170,7 +171,7 @@ class DeleteMany(object):
         return not self == other
 
 
-class ReplaceOne(object):
+class ReplaceOne(Generic[_DocumentType]):
     """Represents a replace_one operation."""
 
     __slots__ = ("_filter", "_doc", "_upsert", "_collation", "_hint")
@@ -178,7 +179,7 @@ class ReplaceOne(object):
     def __init__(
         self,
         filter: Mapping[str, Any],
-        replacement: Mapping[str, Any],
+        replacement: Union[_DocumentType, RawBSONDocument],
         upsert: bool = False,
         collation: Optional[_CollationIn] = None,
         hint: Optional[_IndexKeyHint] = None,
@@ -434,7 +435,9 @@ class IndexModel(object):
 
         For use with :meth:`~pymongo.collection.Collection.create_indexes`.
 
-        Takes either a single key or a list of (key, direction) pairs.
+        Takes either a single key or a list containing (key, direction) pairs
+        or keys.  If no direction is given, :data:`~pymongo.ASCENDING` will
+        be assumed.
         The key(s) must be an instance of :class:`basestring`
         (:class:`str` in python 3), and the direction(s) must be one of
         (:data:`~pymongo.ASCENDING`, :data:`~pymongo.DESCENDING`,
@@ -476,8 +479,8 @@ class IndexModel(object):
         server version.
 
         :Parameters:
-          - `keys`: a single key or a list of (key, direction)
-            pairs specifying the index to create
+          - `keys`: a single key or a list containing (key, direction) pairs
+             or keys specifying the index to create
           - `**kwargs` (optional): any additional index creation
             options (see the above list) should be passed as keyword
             arguments
@@ -488,7 +491,7 @@ class IndexModel(object):
            Added the ``partialFilterExpression`` option to support partial
            indexes.
 
-        .. _wildcard index: https://docs.mongodb.com/master/core/index-wildcard/
+        .. _wildcard index: https://mongodb.com/docs/master/core/index-wildcard/
         """
         keys = _index_list(keys)
         if "name" not in kwargs:

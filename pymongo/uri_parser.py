@@ -15,6 +15,7 @@
 
 """Tools to parse and validate a MongoDB URI."""
 import re
+import sys
 import warnings
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple, Union
 from urllib.parse import unquote_plus
@@ -133,7 +134,7 @@ def parse_host(entity: str, default_port: Optional[int] = DEFAULT_PORT) -> _Addr
         host, port = host.split(":", 1)
     if isinstance(port, str):
         if not port.isdigit() or int(port) > 65535 or int(port) <= 0:
-            raise ValueError("Port must be an integer between 0 and 65535: %s" % (port,))
+            raise ValueError("Port must be an integer between 0 and 65535: %r" % (port,))
         port = int(port)
 
     # Normalize hostname to lowercase, since DNS is case-insensitive:
@@ -468,8 +469,8 @@ def parse_uri(
             raise ConfigurationError(
                 'The "dnspython" module must be '
                 "installed to use mongodb+srv:// URIs. "
-                "To fix this error install pymongo with the srv extra:\n "
-                '%s -m pip install "pymongo[srv]"' % (python_path)
+                "To fix this error install pymongo again:\n "
+                "%s -m pip install pymongo>=4.3" % (python_path)
             )
         is_srv = True
         scheme_free = uri[SRV_SCHEME_LEN:]
@@ -604,7 +605,6 @@ def _parse_kms_tls_options(kms_tls_options):
             "tlsInsecure",
             "tlsAllowInvalidCertificates",
             "tlsAllowInvalidHostnames",
-            "tlsDisableOCSPEndpointCheck",
             "tlsDisableCertificateRevocationCheck",
         ]:
             if n in opts:
@@ -615,7 +615,6 @@ def _parse_kms_tls_options(kms_tls_options):
 
 if __name__ == "__main__":
     import pprint
-    import sys
 
     try:
         pprint.pprint(parse_uri(sys.argv[1]))

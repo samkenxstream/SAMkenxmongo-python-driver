@@ -23,12 +23,11 @@ Causally Consistent Reads
 
   with client.start_session(causal_consistency=True) as session:
       collection = client.db.collection
-      collection.update_one({'_id': 1}, {'$set': {'x': 10}}, session=session)
-      secondary_c = collection.with_options(
-          read_preference=ReadPreference.SECONDARY)
+      collection.update_one({"_id": 1}, {"$set": {"x": 10}}, session=session)
+      secondary_c = collection.with_options(read_preference=ReadPreference.SECONDARY)
 
       # A secondary read waits for replication of the write.
-      secondary_c.find_one({'_id': 1}, session=session)
+      secondary_c.find_one({"_id": 1}, session=session)
 
 If `causal_consistency` is True (the default), read operations that use
 the session are causally after previous read and write operations. Using a
@@ -57,8 +56,11 @@ operation:
   with client.start_session() as session:
       with session.start_transaction():
           orders.insert_one({"sku": "abc123", "qty": 100}, session=session)
-          inventory.update_one({"sku": "abc123", "qty": {"$gte": 100}},
-                               {"$inc": {"qty": -100}}, session=session)
+          inventory.update_one(
+              {"sku": "abc123", "qty": {"$gte": 100}},
+              {"$inc": {"qty": -100}},
+              session=session,
+          )
 
 Upon normal completion of ``with session.start_transaction()`` block, the
 transaction automatically calls :meth:`ClientSession.commit_transaction`.
@@ -140,7 +142,6 @@ from typing import (
     Any,
     Callable,
     ContextManager,
-    Generic,
     Mapping,
     NoReturn,
     Optional,
@@ -151,6 +152,7 @@ from bson.binary import Binary
 from bson.int64 import Int64
 from bson.son import SON
 from bson.timestamp import Timestamp
+from pymongo import _csot
 from pymongo.cursor import _SocketManager
 from pymongo.errors import (
     ConfigurationError,
@@ -164,7 +166,6 @@ from pymongo.helpers import _RETRYABLE_ERROR_CODES
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference, _ServerMode
 from pymongo.server_type import SERVER_TYPE
-from pymongo.typings import _DocumentType
 from pymongo.write_concern import WriteConcern
 
 
@@ -436,7 +437,7 @@ def _max_time_expired_error(exc):
 
 # From the transactions spec, all the retryable writes errors plus
 # WriteConcernFailed.
-_UNKNOWN_COMMIT_ERROR_CODES = _RETRYABLE_ERROR_CODES | frozenset(
+_UNKNOWN_COMMIT_ERROR_CODES: frozenset = _RETRYABLE_ERROR_CODES | frozenset(
     [
         64,  # WriteConcernFailed
         50,  # MaxTimeMSExpired
@@ -461,7 +462,7 @@ if TYPE_CHECKING:
     from pymongo.mongo_client import MongoClient
 
 
-class ClientSession(Generic[_DocumentType]):
+class ClientSession:
     """A session for ordering sequential operations.
 
     :class:`ClientSession` instances are **not thread-safe or fork-safe**.
@@ -476,13 +477,13 @@ class ClientSession(Generic[_DocumentType]):
 
     def __init__(
         self,
-        client: "MongoClient[_DocumentType]",
+        client: "MongoClient",
         server_session: Any,
         options: SessionOptions,
         implicit: bool,
     ) -> None:
         # A MongoClient, a _ServerSession, a SessionOptions, and a set.
-        self._client: MongoClient[_DocumentType] = client
+        self._client: MongoClient = client
         self._server_session = server_session
         self._options = options
         self._cluster_time = None
@@ -515,14 +516,14 @@ class ClientSession(Generic[_DocumentType]):
         if self._server_session is None:
             raise InvalidOperation("Cannot use ended session")
 
-    def __enter__(self) -> "ClientSession[_DocumentType]":
+    def __enter__(self) -> "ClientSession":
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self._end_session(lock=True)
 
     @property
-    def client(self) -> "MongoClient[_DocumentType]":
+    def client(self) -> "MongoClient":
         """The :class:`~pymongo.mongo_client.MongoClient` this session was
         created from.
         """
@@ -828,7 +829,7 @@ class ClientSession(Generic[_DocumentType]):
         wc = opts.write_concern
         cmd = SON([(command_name, 1)])
         if command_name == "commitTransaction":
-            if opts.max_commit_time_ms:
+            if opts.max_commit_time_ms and _csot.get_timeout() is None:
                 cmd["maxTimeMS"] = opts.max_commit_time_ms
 
             # Transaction spec says that after the initial commit attempt,

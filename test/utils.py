@@ -29,15 +29,31 @@ import warnings
 from collections import abc, defaultdict
 from functools import partial
 from test import client_context, db_pwd, db_user
+from typing import Any, List
 
 from bson import json_util
 from bson.objectid import ObjectId
 from bson.son import SON
 from pymongo import MongoClient, monitoring, operations, read_preferences
 from pymongo.collection import ReturnDocument
+from pymongo.cursor import CursorType
 from pymongo.errors import ConfigurationError, OperationFailure
 from pymongo.hello import HelloCompat
-from pymongo.monitoring import _SENSITIVE_COMMANDS
+from pymongo.lock import _create_lock
+from pymongo.monitoring import (
+    _SENSITIVE_COMMANDS,
+    ConnectionCheckedInEvent,
+    ConnectionCheckedOutEvent,
+    ConnectionCheckOutFailedEvent,
+    ConnectionCheckOutStartedEvent,
+    ConnectionClosedEvent,
+    ConnectionCreatedEvent,
+    ConnectionReadyEvent,
+    PoolClearedEvent,
+    PoolClosedEvent,
+    PoolCreatedEvent,
+    PoolReadyEvent,
+)
 from pymongo.pool import _CancellationContext, _PoolGeneration
 from pymongo.read_concern import ReadConcern
 from pymongo.read_preferences import ReadPreference
@@ -80,59 +96,87 @@ class BaseListener(object):
 
 class CMAPListener(BaseListener, monitoring.ConnectionPoolListener):
     def connection_created(self, event):
+        assert isinstance(event, ConnectionCreatedEvent)
         self.add_event(event)
 
     def connection_ready(self, event):
+        assert isinstance(event, ConnectionReadyEvent)
         self.add_event(event)
 
     def connection_closed(self, event):
+        assert isinstance(event, ConnectionClosedEvent)
         self.add_event(event)
 
     def connection_check_out_started(self, event):
+        assert isinstance(event, ConnectionCheckOutStartedEvent)
         self.add_event(event)
 
     def connection_check_out_failed(self, event):
+        assert isinstance(event, ConnectionCheckOutFailedEvent)
         self.add_event(event)
 
     def connection_checked_out(self, event):
+        assert isinstance(event, ConnectionCheckedOutEvent)
         self.add_event(event)
 
     def connection_checked_in(self, event):
+        assert isinstance(event, ConnectionCheckedInEvent)
         self.add_event(event)
 
     def pool_created(self, event):
+        assert isinstance(event, PoolCreatedEvent)
         self.add_event(event)
 
     def pool_ready(self, event):
+        assert isinstance(event, PoolReadyEvent)
         self.add_event(event)
 
     def pool_cleared(self, event):
+        assert isinstance(event, PoolClearedEvent)
         self.add_event(event)
 
     def pool_closed(self, event):
+        assert isinstance(event, PoolClosedEvent)
         self.add_event(event)
 
 
-class EventListener(monitoring.CommandListener):
+class EventListener(BaseListener, monitoring.CommandListener):
     def __init__(self):
+        super(EventListener, self).__init__()
         self.results = defaultdict(list)
 
-    def started(self, event):
-        self.results["started"].append(event)
+    @property
+    def started_events(self) -> List[monitoring.CommandStartedEvent]:
+        return self.results["started"]
 
-    def succeeded(self, event):
-        self.results["succeeded"].append(event)
+    @property
+    def succeeded_events(self) -> List[monitoring.CommandSucceededEvent]:
+        return self.results["succeeded"]
 
-    def failed(self, event):
-        self.results["failed"].append(event)
+    @property
+    def failed_events(self) -> List[monitoring.CommandFailedEvent]:
+        return self.results["failed"]
 
-    def started_command_names(self):
+    def started(self, event: monitoring.CommandStartedEvent) -> None:
+        self.started_events.append(event)
+        self.add_event(event)
+
+    def succeeded(self, event: monitoring.CommandSucceededEvent) -> None:
+        self.succeeded_events.append(event)
+        self.add_event(event)
+
+    def failed(self, event: monitoring.CommandFailedEvent) -> None:
+        self.failed_events.append(event)
+        self.add_event(event)
+
+    def started_command_names(self) -> List[str]:
         """Return list of command names started."""
-        return [event.command_name for event in self.results["started"]]
+        return [event.command_name for event in self.started_events]
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset the state of this listener."""
         self.results.clear()
+        super(EventListener, self).reset()
 
 
 class TopologyEventListener(monitoring.TopologyListener):
@@ -173,6 +217,8 @@ class AllowListEventListener(EventListener):
 
 class OvertCommandListener(EventListener):
     """A CommandListener that ignores sensitive commands."""
+
+    ignore_list_collections = False
 
     def started(self, event):
         if event.command_name.lower() not in _SENSITIVE_COMMANDS:
@@ -252,7 +298,7 @@ class MockSocketInfo(object):
 class MockPool(object):
     def __init__(self, address, options, handshake=True):
         self.gen = _PoolGeneration()
-        self._lock = threading.Lock()
+        self._lock = _create_lock()
         self.opts = options
         self.operation_count = 0
 
@@ -529,27 +575,27 @@ def _mongo_client(host, port, authenticate=True, directConnection=None, **kwargs
     return MongoClient(uri, port, **client_options)
 
 
-def single_client_noauth(h=None, p=None, **kwargs):
+def single_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
     """Make a direct connection. Don't authenticate."""
     return _mongo_client(h, p, authenticate=False, directConnection=True, **kwargs)
 
 
-def single_client(h=None, p=None, **kwargs):
+def single_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
     """Make a direct connection, and authenticate if necessary."""
     return _mongo_client(h, p, directConnection=True, **kwargs)
 
 
-def rs_client_noauth(h=None, p=None, **kwargs):
+def rs_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
     """Connect to the replica set. Don't authenticate."""
     return _mongo_client(h, p, authenticate=False, **kwargs)
 
 
-def rs_client(h=None, p=None, **kwargs):
+def rs_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
     """Connect to the replica set and authenticate if necessary."""
     return _mongo_client(h, p, **kwargs)
 
 
-def rs_or_single_client_noauth(h=None, p=None, **kwargs):
+def rs_or_single_client_noauth(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[dict]:
     """Connect to the replica set if there is one, otherwise the standalone.
 
     Like rs_or_single_client, but does not authenticate.
@@ -557,7 +603,7 @@ def rs_or_single_client_noauth(h=None, p=None, **kwargs):
     return _mongo_client(h, p, authenticate=False, **kwargs)
 
 
-def rs_or_single_client(h=None, p=None, **kwargs):
+def rs_or_single_client(h: Any = None, p: Any = None, **kwargs: Any) -> MongoClient[Any]:
     """Connect to the replica set if there is one, otherwise the standalone.
 
     Authenticates if necessary.
@@ -565,7 +611,7 @@ def rs_or_single_client(h=None, p=None, **kwargs):
     return _mongo_client(h, p, **kwargs)
 
 
-def ensure_all_connected(client):
+def ensure_all_connected(client: MongoClient) -> None:
     """Ensure that the client's connection pool has socket connections to all
     members of a replica set. Raises ConfigurationError when called with a
     non-replica set client.
@@ -573,18 +619,30 @@ def ensure_all_connected(client):
     Depending on the use-case, the caller may need to clear any event listeners
     that are configured on the client.
     """
-    hello = client.admin.command(HelloCompat.LEGACY_CMD)
+    hello: dict = client.admin.command(HelloCompat.LEGACY_CMD)
     if "setName" not in hello:
         raise ConfigurationError("cluster is not a replica set")
 
-    target_host_list = set(hello["hosts"])
+    target_host_list = set(hello["hosts"] + hello.get("passives", []))
     connected_host_list = set([hello["me"]])
-    admindb = client.get_database("admin")
 
     # Run hello until we have connected to each host at least once.
-    while connected_host_list != target_host_list:
-        hello = admindb.command(HelloCompat.LEGACY_CMD, read_preference=ReadPreference.SECONDARY)
-        connected_host_list.update([hello["me"]])
+    def discover():
+        i = 0
+        while i < 100 and connected_host_list != target_host_list:
+            hello: dict = client.admin.command(
+                HelloCompat.LEGACY_CMD, read_preference=ReadPreference.SECONDARY
+            )
+            connected_host_list.update([hello["me"]])
+            i += 1
+        return connected_host_list
+
+    try:
+        wait_until(lambda: target_host_list == discover(), "connected to all hosts")
+    except AssertionError as exc:
+        raise AssertionError(
+            f"{exc}, {connected_host_list} != {target_host_list}, {client.topology_description}"
+        )
 
 
 def one(s):
@@ -640,6 +698,9 @@ def parse_collection_options(opts):
 
     if "readConcern" in opts:
         opts["read_concern"] = ReadConcern(**dict(opts.pop("readConcern")))
+
+    if "timeoutMS" in opts:
+        opts["timeout"] = int(opts.pop("timeoutMS")) / 1000.0
     return opts
 
 
@@ -875,17 +936,14 @@ def lazy_client_trial(reset, target, test, get_client):
 
 def gevent_monkey_patched():
     """Check if gevent's monkey patching is active."""
-    # In Python 3.6 importing gevent.socket raises an ImportWarning.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ImportWarning)
-        try:
-            import socket
+    try:
+        import socket
 
-            import gevent.socket
+        import gevent.socket
 
-            return socket.socket is gevent.socket.socket
-        except ImportError:
-            return False
+        return socket.socket is gevent.socket.socket
+    except ImportError:
+        return False
 
 
 def eventlet_monkey_patched():
@@ -964,10 +1022,7 @@ def assertion_context(msg):
     try:
         yield
     except AssertionError as exc:
-        msg = "%s (%s)" % (exc, msg)
-        exc_type, exc_val, exc_tb = sys.exc_info()
-        assert exc_type is not None
-        raise exc_type(exc_val).with_traceback(exc_tb)
+        raise AssertionError(f"{msg}: {exc}")
 
 
 def parse_spec_options(opts):
@@ -979,6 +1034,10 @@ def parse_spec_options(opts):
 
     if "readConcern" in opts:
         opts["read_concern"] = ReadConcern(**dict(opts.pop("readConcern")))
+
+    if "timeoutMS" in opts:
+        assert isinstance(opts["timeoutMS"], int)
+        opts["timeout"] = int(opts.pop("timeoutMS")) / 1000.0
 
     if "maxTimeMS" in opts:
         opts["max_time_ms"] = opts.pop("maxTimeMS")
@@ -1031,6 +1090,8 @@ def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callbac
         # Aggregate uses "batchSize", while find uses batch_size.
         elif (arg_name == "batchSize" or arg_name == "allowDiskUse") and opname == "aggregate":
             continue
+        elif arg_name == "timeoutMode":
+            raise unittest.SkipTest("PyMongo does not support timeoutMode")
         # Requires boolean returnDocument.
         elif arg_name == "returnDocument":
             arguments[c2s] = getattr(ReturnDocument, arguments.pop(arg_name).upper())
@@ -1052,14 +1113,9 @@ def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callbac
             arguments["requests"] = requests
         elif arg_name == "session":
             arguments["session"] = entity_map[arguments["session"]]
-        elif opname in ("command", "run_admin_command") and arg_name == "command":
-            # Ensure the first key is the command name.
-            ordered_command = SON([(spec["command_name"], 1)])
-            ordered_command.update(arguments["command"])
-            arguments["command"] = ordered_command
         elif opname == "open_download_stream" and arg_name == "id":
             arguments["file_id"] = arguments.pop(arg_name)
-        elif opname != "find" and c2s == "max_time_ms":
+        elif opname not in ("find", "find_one") and c2s == "max_time_ms":
             # find is the only method that accepts snake_case max_time_ms.
             # All other methods take kwargs which must use the server's
             # camelCase maxTimeMS. See PYTHON-1855.
@@ -1077,11 +1133,24 @@ def prepare_spec_arguments(spec, arguments, opname, entity_map, with_txn_callbac
         elif opname == "create_collection":
             if arg_name == "collection":
                 arguments["name"] = arguments.pop(arg_name)
+            arguments["check_exists"] = False
             # Any other arguments to create_collection are passed through
             # **kwargs.
         elif opname == "create_index" and arg_name == "keys":
             arguments["keys"] = list(arguments.pop(arg_name).items())
         elif opname == "drop_index" and arg_name == "name":
             arguments["index_or_name"] = arguments.pop(arg_name)
+        elif opname == "rename" and arg_name == "to":
+            arguments["new_name"] = arguments.pop(arg_name)
+        elif opname == "rename" and arg_name == "dropTarget":
+            arguments["dropTarget"] = arguments.pop(arg_name)
+        elif arg_name == "cursorType":
+            cursor_type = arguments.pop(arg_name)
+            if cursor_type == "tailable":
+                arguments["cursor_type"] = CursorType.TAILABLE
+            elif cursor_type == "tailableAwait":
+                arguments["cursor_type"] = CursorType.TAILABLE
+            else:
+                assert False, f"Unsupported cursorType: {cursor_type}"
         else:
             arguments[c2s] = arguments.pop(arg_name)

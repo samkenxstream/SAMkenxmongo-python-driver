@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Database level operations."""
+from copy import deepcopy
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,18 +30,19 @@ from typing import (
     cast,
 )
 
-from bson.codec_options import DEFAULT_CODEC_OPTIONS, CodecOptions
+from bson.codec_options import DEFAULT_CODEC_OPTIONS
 from bson.dbref import DBRef
 from bson.son import SON
 from bson.timestamp import Timestamp
-from pymongo import common
+from pymongo import _csot, common
 from pymongo.aggregation import _DatabaseAggregationCommand
 from pymongo.change_stream import DatabaseChangeStream
 from pymongo.collection import Collection
 from pymongo.command_cursor import CommandCursor
+from pymongo.common import _ecc_coll_name, _ecoc_coll_name, _esc_coll_name
 from pymongo.errors import CollectionInvalid, InvalidName
 from pymongo.read_preferences import ReadPreference, _ServerMode
-from pymongo.typings import _CollationIn, _DocumentType, _Pipeline
+from pymongo.typings import _CollationIn, _DocumentType, _DocumentTypeArg, _Pipeline
 
 
 def _check_name(name):
@@ -54,6 +56,8 @@ def _check_name(name):
 
 
 if TYPE_CHECKING:
+    import bson
+    import bson.codec_options
     from pymongo.client_session import ClientSession
     from pymongo.mongo_client import MongoClient
     from pymongo.read_concern import ReadConcern
@@ -70,7 +74,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         self,
         client: "MongoClient[_DocumentType]",
         name: str,
-        codec_options: Optional[CodecOptions] = None,
+        codec_options: Optional["bson.CodecOptions[_DocumentTypeArg]"] = None,
         read_preference: Optional[_ServerMode] = None,
         write_concern: Optional["WriteConcern"] = None,
         read_concern: Optional["ReadConcern"] = None,
@@ -136,6 +140,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         self.__name = name
         self.__client: MongoClient[_DocumentType] = client
+        self._timeout = client.options.timeout
 
     @property
     def client(self) -> "MongoClient[_DocumentType]":
@@ -149,7 +154,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
     def with_options(
         self,
-        codec_options: Optional[CodecOptions] = None,
+        codec_options: Optional["bson.CodecOptions[_DocumentTypeArg]"] = None,
         read_preference: Optional[_ServerMode] = None,
         write_concern: Optional["WriteConcern"] = None,
         read_concern: Optional["ReadConcern"] = None,
@@ -158,12 +163,12 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
           >>> db1.read_preference
           Primary()
-          >>> from pymongo import ReadPreference
-          >>> db2 = db1.with_options(read_preference=ReadPreference.SECONDARY)
+          >>> from pymongo.read_preferences import Secondary
+          >>> db2 = db1.with_options(read_preference=Secondary([{'node': 'analytics'}]))
           >>> db1.read_preference
           Primary()
           >>> db2.read_preference
-          Secondary(tag_sets=None)
+          Secondary(tag_sets=[{'node': 'analytics'}], max_staleness=-1, hedge=None)
 
         :Parameters:
           - `codec_options` (optional): An instance of
@@ -236,7 +241,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
     def get_collection(
         self,
         name: str,
-        codec_options: Optional[CodecOptions] = None,
+        codec_options: Optional["bson.CodecOptions[_DocumentTypeArg]"] = None,
         read_preference: Optional[_ServerMode] = None,
         write_concern: Optional["WriteConcern"] = None,
         read_concern: Optional["ReadConcern"] = None,
@@ -279,17 +284,47 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             used.
         """
         return Collection(
-            self, name, False, codec_options, read_preference, write_concern, read_concern
+            self,
+            name,
+            False,
+            codec_options,
+            read_preference,
+            write_concern,
+            read_concern,
         )
 
+    def _get_encrypted_fields(self, kwargs, coll_name, ask_db):
+        encrypted_fields = kwargs.get("encryptedFields")
+        if encrypted_fields:
+            return deepcopy(encrypted_fields)
+        if (
+            self.client.options.auto_encryption_opts
+            and self.client.options.auto_encryption_opts._encrypted_fields_map
+            and self.client.options.auto_encryption_opts._encrypted_fields_map.get(
+                f"{self.name}.{coll_name}"
+            )
+        ):
+            return deepcopy(
+                self.client.options.auto_encryption_opts._encrypted_fields_map[
+                    f"{self.name}.{coll_name}"
+                ]
+            )
+        if ask_db and self.client.options.auto_encryption_opts:
+            options = self[coll_name].options()
+            if options.get("encryptedFields"):
+                return deepcopy(options["encryptedFields"])
+        return None
+
+    @_csot.apply
     def create_collection(
         self,
         name: str,
-        codec_options: Optional[CodecOptions] = None,
+        codec_options: Optional["bson.CodecOptions[_DocumentTypeArg]"] = None,
         read_preference: Optional[_ServerMode] = None,
         write_concern: Optional["WriteConcern"] = None,
         read_concern: Optional["ReadConcern"] = None,
         session: Optional["ClientSession"] = None,
+        check_exists: Optional[bool] = True,
         **kwargs: Any,
     ) -> Collection[_DocumentType]:
         """Create a new :class:`~pymongo.collection.Collection` in this
@@ -321,6 +356,8 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             :class:`~pymongo.collation.Collation`.
           - `session` (optional): a
             :class:`~pymongo.client_session.ClientSession`.
+          - ``check_exists`` (optional): if True (the default), send a listCollections command to
+            check if the collection already exists before creation.
           - `**kwargs` (optional): additional keyword arguments will
             be passed as options for the `create collection command`_
 
@@ -352,6 +389,42 @@ class Database(common.BaseObject, Generic[_DocumentType]):
           - ``pipeline`` (list): a list of aggregation pipeline stages
           - ``comment`` (str): a user-provided comment to attach to this command.
             This option is only supported on MongoDB >= 4.4.
+          - ``encryptedFields`` (dict): **(BETA)** Document that describes the encrypted fields for
+            Queryable Encryption. For example::
+
+                {
+                  "escCollection": "enxcol_.encryptedCollection.esc",
+                  "eccCollection": "enxcol_.encryptedCollection.ecc",
+                  "ecocCollection": "enxcol_.encryptedCollection.ecoc",
+                  "fields": [
+                      {
+                          "path": "firstName",
+                          "keyId": Binary.from_uuid(UUID('00000000-0000-0000-0000-000000000000')),
+                          "bsonType": "string",
+                          "queries": {"queryType": "equality"}
+                      },
+                      {
+                          "path": "ssn",
+                          "keyId": Binary.from_uuid(UUID('04104104-1041-0410-4104-104104104104')),
+                          "bsonType": "string"
+                      }
+                    ]
+                }
+          - ``clusteredIndex`` (dict): Document that specifies the clustered index
+            configuration. It must have the following form::
+
+                {
+                    // key pattern must be {_id: 1}
+                    key: <key pattern>, // required
+                    unique: <bool>, // required, must be ‘true’
+                    name: <string>, // optional, otherwise automatically generated
+                    v: <int>, // optional, must be ‘2’ if provided
+                }
+          - ``changeStreamPreAndPostImages`` (dict): a document with a boolean field ``enabled`` for
+            enabling pre- and post-images.
+
+        .. versionchanged:: 4.2
+           Added the ``check_exists``, ``clusteredIndex``, and  ``encryptedFields`` parameters.
 
         .. versionchanged:: 3.11
            This method is now supported inside multi-document transactions
@@ -367,16 +440,26 @@ class Database(common.BaseObject, Generic[_DocumentType]):
            Added the codec_options, read_preference, and write_concern options.
 
         .. _create collection command:
-            https://docs.mongodb.com/manual/reference/command/create
+            https://mongodb.com/docs/manual/reference/command/create
         """
+        encrypted_fields = self._get_encrypted_fields(kwargs, name, False)
+        if encrypted_fields:
+            common.validate_is_mapping("encryptedFields", encrypted_fields)
+            kwargs["encryptedFields"] = encrypted_fields
+
+        clustered_index = kwargs.get("clusteredIndex")
+        if clustered_index:
+            common.validate_is_mapping("clusteredIndex", clustered_index)
+
         with self.__client._tmp_session(session) as s:
             # Skip this check in a transaction where listCollections is not
             # supported.
-            if (not s or not s.in_transaction) and name in self.list_collection_names(
-                filter={"name": name}, session=s
+            if (
+                check_exists
+                and (not s or not s.in_transaction)
+                and name in self.list_collection_names(filter={"name": name}, session=s)
             ):
                 raise CollectionInvalid("collection %s already exists" % name)
-
             return Collection(
                 self,
                 name,
@@ -448,10 +531,10 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         .. versionadded:: 3.9
 
         .. _aggregation pipeline:
-            https://docs.mongodb.com/manual/reference/operator/aggregation-pipeline
+            https://mongodb.com/docs/manual/reference/operator/aggregation-pipeline
 
         .. _aggregate command:
-            https://docs.mongodb.com/manual/reference/command/aggregate
+            https://mongodb.com/docs/manual/reference/command/aggregate
         """
         with self.client._tmp_session(session, close=False) as s:
             cmd = _DatabaseAggregationCommand(
@@ -478,6 +561,8 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         session: Optional["ClientSession"] = None,
         start_after: Optional[Mapping[str, Any]] = None,
         comment: Optional[Any] = None,
+        full_document_before_change: Optional[str] = None,
+        show_expanded_events: Optional[bool] = None,
     ) -> DatabaseChangeStream[_DocumentType]:
         """Watch changes on this database.
 
@@ -506,14 +591,13 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         .. code-block:: python
 
             try:
-                with db.watch(
-                        [{'$match': {'operationType': 'insert'}}]) as stream:
+                with db.watch([{"$match": {"operationType": "insert"}}]) as stream:
                     for insert_change in stream:
                         print(insert_change)
             except pymongo.errors.PyMongoError:
                 # The ChangeStream encountered an unrecoverable error or the
                 # resume attempt failed to recreate the cursor.
-                logging.error('...')
+                logging.error("...")
 
         For a precise description of the resume process see the
         `change streams specification`_.
@@ -524,11 +608,15 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             pipeline stages are valid after a ``$changeStream`` stage, see the
             MongoDB documentation on change streams for the supported stages.
           - `full_document` (optional): The fullDocument to pass as an option
-            to the ``$changeStream`` stage. Allowed values: 'updateLookup'.
-            When set to 'updateLookup', the change notification for partial
-            updates will include both a delta describing the changes to the
-            document, as well as a copy of the entire document that was
-            changed from some time after the change occurred.
+            to the ``$changeStream`` stage. Allowed values: 'updateLookup',
+            'whenAvailable', 'required'. When set to 'updateLookup', the
+            change notification for partial updates will include both a delta
+            describing the changes to the document, as well as a copy of the
+            entire document that was changed from some time after the change
+            occurred.
+          - `full_document_before_change`: Allowed values: 'whenAvailable'
+            and 'required'. Change events may now result in a
+            'fullDocumentBeforeChange' response field.
           - `resume_after` (optional): A resume token. If provided, the
             change stream will start returning changes that occur directly
             after the operation specified in the resume token. A resume token
@@ -551,9 +639,16 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             This option and `resume_after` are mutually exclusive.
           - `comment` (optional): A user-provided comment to attach to this
             command.
+          - `show_expanded_events` (optional): Include expanded events such as DDL events like `dropIndexes`.
 
         :Returns:
           A :class:`~pymongo.change_stream.DatabaseChangeStream` cursor.
+
+        .. versionchanged:: 4.3
+           Added `show_expanded_events` parameter.
+
+        .. versionchanged:: 4.2
+            Added ``full_document_before_change`` parameter.
 
         .. versionchanged:: 4.1
            Added ``comment`` parameter.
@@ -563,7 +658,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         .. versionadded:: 3.7
 
-        .. seealso:: The MongoDB documentation on `changeStreams <https://docs.mongodb.com/manual/changeStreams/>`_.
+        .. seealso:: The MongoDB documentation on `changeStreams <https://mongodb.com/docs/manual/changeStreams/>`_.
 
         .. _change streams specification:
             https://github.com/mongodb/specifications/blob/master/source/change-streams/change-streams.rst
@@ -579,7 +674,9 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             start_at_operation_time,
             session,
             start_after,
-            comment=comment,
+            comment,
+            full_document_before_change,
+            show_expanded_events=show_expanded_events,
         )
 
     def _command(
@@ -615,6 +712,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
                 client=self.__client,
             )
 
+    @_csot.apply
     def command(
         self,
         command: Union[str, MutableMapping[str, Any]],
@@ -622,7 +720,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         check: bool = True,
         allowable_errors: Optional[Sequence[Union[str, int]]] = None,
         read_preference: Optional[_ServerMode] = None,
-        codec_options: "Optional[CodecOptions[_CodecDocumentType]]" = None,
+        codec_options: "Optional[bson.codec_options.CodecOptions[_CodecDocumentType]]" = None,
         session: Optional["ClientSession"] = None,
         comment: Optional[Any] = None,
         **kwargs: Any,
@@ -687,14 +785,14 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         .. note:: :meth:`command` does **not** obey this Database's
            :attr:`read_preference` or :attr:`codec_options`. You must use the
-           `read_preference` and `codec_options` parameters instead.
+           ``read_preference`` and ``codec_options`` parameters instead.
 
         .. note:: :meth:`command` does **not** apply any custom TypeDecoders
            when decoding the command response.
 
         .. note:: If this client has been configured to use MongoDB Stable
            API (see :ref:`versioned-api-ref`), then :meth:`command` will
-           automactically add API versioning options to the given command.
+           automatically add API versioning options to the given command.
            Explicitly adding API versioning options in the command and
            declaring an API version on the client is not supported.
 
@@ -708,7 +806,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
            regular expressions as :class:`~bson.regex.Regex` objects. Use
            :meth:`~bson.regex.Regex.try_compile` to attempt to convert from a
            BSON regular expression to a Python regular expression object.
-           Added the `codec_options` parameter.
+           Added the ``codec_options`` parameter.
 
         .. seealso:: The MongoDB documentation on `commands <https://dochub.mongodb.org/core/commands>`_.
         """
@@ -803,7 +901,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             command.
           - `**kwargs` (optional): Optional parameters of the
             `listCollections command
-            <https://docs.mongodb.com/manual/reference/command/listCollections/>`_
+            <https://mongodb.com/docs/manual/reference/command/listCollections/>`_
             can be passed as keyword arguments to this method. The supported
             options differ by server version.
 
@@ -849,7 +947,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             command.
           - `**kwargs` (optional): Optional parameters of the
             `listCollections command
-            <https://docs.mongodb.com/manual/reference/command/listCollections/>`_
+            <https://mongodb.com/docs/manual/reference/command/listCollections/>`_
             can be passed as keyword arguments to this method. The supported
             options differ by server version.
 
@@ -874,11 +972,28 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         return [result["name"] for result in self.list_collections(session=session, **kwargs)]
 
+    def _drop_helper(self, name, session=None, comment=None):
+        command = SON([("drop", name)])
+        if comment is not None:
+            command["comment"] = comment
+
+        with self.__client._socket_for_writes(session) as sock_info:
+            return self._command(
+                sock_info,
+                command,
+                allowable_errors=["ns not found", 26],
+                write_concern=self._write_concern_for(session),
+                parse_write_concern_error=True,
+                session=session,
+            )
+
+    @_csot.apply
     def drop_collection(
         self,
-        name_or_collection: Union[str, Collection],
+        name_or_collection: Union[str, Collection[_DocumentTypeArg]],
         session: Optional["ClientSession"] = None,
         comment: Optional[Any] = None,
+        encrypted_fields: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Drop a collection.
 
@@ -889,10 +1004,35 @@ class Database(common.BaseObject, Generic[_DocumentType]):
             :class:`~pymongo.client_session.ClientSession`.
           - `comment` (optional): A user-provided comment to attach to this
             command.
+          - `encrypted_fields`: **(BETA)** Document that describes the encrypted fields for
+            Queryable Encryption. For example::
+
+                {
+                  "escCollection": "enxcol_.encryptedCollection.esc",
+                  "eccCollection": "enxcol_.encryptedCollection.ecc",
+                  "ecocCollection": "enxcol_.encryptedCollection.ecoc",
+                  "fields": [
+                      {
+                          "path": "firstName",
+                          "keyId": Binary.from_uuid(UUID('00000000-0000-0000-0000-000000000000')),
+                          "bsonType": "string",
+                          "queries": {"queryType": "equality"}
+                      },
+                      {
+                          "path": "ssn",
+                          "keyId": Binary.from_uuid(UUID('04104104-1041-0410-4104-104104104104')),
+                          "bsonType": "string"
+                      }
+                  ]
+
+                }
 
 
         .. note:: The :attr:`~pymongo.database.Database.write_concern` of
            this database is automatically applied to this operation.
+
+        .. versionchanged:: 4.2
+           Added ``encrypted_fields`` parameter.
 
         .. versionchanged:: 4.1
            Added ``comment`` parameter.
@@ -911,24 +1051,28 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         if not isinstance(name, str):
             raise TypeError("name_or_collection must be an instance of str")
-
-        command = SON([("drop", name)])
-        if comment is not None:
-            command["comment"] = comment
-
-        with self.__client._socket_for_writes(session) as sock_info:
-            return self._command(
-                sock_info,
-                command,
-                allowable_errors=["ns not found", 26],
-                write_concern=self._write_concern_for(session),
-                parse_write_concern_error=True,
-                session=session,
+        encrypted_fields = self._get_encrypted_fields(
+            {"encryptedFields": encrypted_fields},
+            name,
+            True,
+        )
+        if encrypted_fields:
+            common.validate_is_mapping("encrypted_fields", encrypted_fields)
+            self._drop_helper(
+                _esc_coll_name(encrypted_fields, name), session=session, comment=comment
             )
+            self._drop_helper(
+                _ecc_coll_name(encrypted_fields, name), session=session, comment=comment
+            )
+            self._drop_helper(
+                _ecoc_coll_name(encrypted_fields, name), session=session, comment=comment
+            )
+
+        return self._drop_helper(name, session, comment)
 
     def validate_collection(
         self,
-        name_or_collection: Union[str, Collection],
+        name_or_collection: Union[str, Collection[_DocumentTypeArg]],
         scandata: bool = False,
         full: bool = False,
         session: Optional["ClientSession"] = None,
@@ -967,7 +1111,7 @@ class Database(common.BaseObject, Generic[_DocumentType]):
         .. versionchanged:: 3.6
            Added ``session`` parameter.
 
-        .. _validate command: https://docs.mongodb.com/manual/reference/command/validate/
+        .. _validate command: https://mongodb.com/docs/manual/reference/command/validate/
         """
         name = name_or_collection
         if isinstance(name, Collection):
@@ -1009,8 +1153,8 @@ class Database(common.BaseObject, Generic[_DocumentType]):
 
         return result
 
-    def __iter__(self) -> "Database[_DocumentType]":
-        return self
+    # See PYTHON-3084.
+    __iter__ = None
 
     def __next__(self) -> NoReturn:
         raise TypeError("'Database' object is not iterable")

@@ -28,6 +28,9 @@ everything you need to know to use **PyMongo**.
 :doc:`examples/encryption`
   Using PyMongo with client side encryption.
 
+:doc:`examples/type_hints`
+  Using PyMongo with type hints.
+
 :doc:`faq`
   Some questions that come up often.
 
@@ -50,6 +53,9 @@ everything you need to know to use **PyMongo**.
 
 :doc:`developer/index`
   Developer guide for contributors to PyMongo.
+
+:doc:`common-issues`
+  Common issues encountered when using PyMongo.
 
 Getting Help
 ------------
@@ -121,3 +127,4 @@ Indices and tables
    python3
    migrate-to-pymongo4
    developer/index
+   common-issues

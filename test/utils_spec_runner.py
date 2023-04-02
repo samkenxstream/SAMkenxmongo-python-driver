@@ -52,7 +52,7 @@ class SpecRunnerThread(threading.Thread):
         super(SpecRunnerThread, self).__init__()
         self.name = name
         self.exc = None
-        self.setDaemon(True)
+        self.daemon = True
         self.cond = threading.Condition()
         self.ops = []
         self.stopped = False
@@ -229,7 +229,19 @@ class SpecRunner(IntegrationTest):
 
             return True
         else:
-            self.assertEqual(result, expected_result)
+
+            def _helper(expected_result, result):
+                if isinstance(expected_result, abc.Mapping):
+                    for i in expected_result.keys():
+                        self.assertEqual(expected_result[i], result[i])
+
+                elif isinstance(expected_result, list):
+                    for i, k in zip(expected_result, result):
+                        _helper(i, k)
+                else:
+                    self.assertEqual(expected_result, result)
+
+            _helper(expected_result, result)
 
     def get_object_name(self, op):
         """Allow subclasses to override handling of 'object'
@@ -294,8 +306,8 @@ class SpecRunner(IntegrationTest):
             args = {"sessions": sessions, "collection": collection}
             args.update(arguments)
             arguments = args
-        result = cmd(**dict(arguments))
 
+        result = cmd(**dict(arguments))
         # Cleanup open change stream cursors.
         if name == "watch":
             self.addCleanup(result.close)
@@ -323,8 +335,7 @@ class SpecRunner(IntegrationTest):
         expected_result = op.get("result")
         if expect_error(op):
             with self.assertRaises(self.allowable_errors(op), msg=op["name"]) as context:
-                self.run_operation(sessions, collection, op.copy())
-
+                out = self.run_operation(sessions, collection, op.copy())
             if expect_error_message(expected_result):
                 if isinstance(context.exception, BulkWriteError):
                     errmsg = str(context.exception.details).lower()
@@ -360,16 +371,16 @@ class SpecRunner(IntegrationTest):
 
     # TODO: factor with test_command_monitoring.py
     def check_events(self, test, listener, session_ids):
-        res = listener.results
+        events = listener.started_events
         if not len(test["expectations"]):
             return
 
         # Give a nicer message when there are missing or extra events
-        cmds = decode_raw([event.command for event in res["started"]])
-        self.assertEqual(len(res["started"]), len(test["expectations"]), cmds)
+        cmds = decode_raw([event.command for event in events])
+        self.assertEqual(len(events), len(test["expectations"]), cmds)
         for i, expectation in enumerate(test["expectations"]):
             event_type = next(iter(expectation))
-            event = res["started"][i]
+            event = events[i]
 
             # The tests substitute 42 for any number other than 0.
             if event.command_name == "getMore" and event.command["getMore"]:
@@ -453,13 +464,20 @@ class SpecRunner(IntegrationTest):
         """Allow specs to override a test's setup."""
         db_name = self.get_scenario_db_name(scenario_def)
         coll_name = self.get_scenario_coll_name(scenario_def)
-        db = client_context.client.get_database(db_name, write_concern=WriteConcern(w="majority"))
-        coll = db[coll_name]
-        coll.drop()
-        db.create_collection(coll_name)
-        if scenario_def["data"]:
-            # Load data.
-            coll.insert_many(scenario_def["data"])
+        documents = scenario_def["data"]
+
+        # Setup the collection with as few majority writes as possible.
+        db = client_context.client.get_database(db_name)
+        coll_exists = bool(db.list_collection_names(filter={"name": coll_name}))
+        if coll_exists:
+            db[coll_name].delete_many({})
+        # Only use majority wc only on the final write.
+        wc = WriteConcern(w="majority")
+        if documents:
+            db.get_collection(coll_name, write_concern=wc).insert_many(documents)
+        elif not coll_exists:
+            # Ensure collection exists.
+            db.create_collection(coll_name, write_concern=wc)
 
     def run_scenario(self, scenario_def, test):
         self.maybe_skip_scenario(test)

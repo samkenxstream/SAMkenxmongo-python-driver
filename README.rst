@@ -13,10 +13,10 @@ database from Python.  The ``bson`` package is an implementation of
 the `BSON format <http://bsonspec.org>`_ for Python. The ``pymongo``
 package is a native Python driver for MongoDB. The ``gridfs`` package
 is a `gridfs
-<http://www.mongodb.org/display/DOCS/GridFS+Specification>`_
+<https://github.com/mongodb/specifications/blob/master/source/gridfs/gridfs-spec.rst/>`_
 implementation on top of ``pymongo``.
 
-PyMongo supports MongoDB 3.6, 4.0, 4.2, 4.4, and 5.0.
+PyMongo supports MongoDB 3.6, 4.0, 4.2, 4.4, 5.0, and 6.0.
 
 Support / Feedback
 ==================
@@ -25,7 +25,7 @@ For issues with, questions about, or feedback for PyMongo, please look into
 our `support channels <https://support.mongodb.com/welcome>`_. Please
 do not email any of the PyMongo developers directly with issues or
 questions - you're more likely to get an answer on the `MongoDB Community
-Forums <https://developer.mongodb.com/community/forums/tag/python-driver>`_.
+Forums <https://www.mongodb.com/community/forums/tag/python>`_.
 
 Bugs / Feature Requests
 =======================
@@ -63,7 +63,7 @@ Security Vulnerabilities
 
 If you’ve identified a security vulnerability in a driver or any other
 MongoDB project, please report it according to the `instructions here
-<http://docs.mongodb.org/manual/tutorial/create-a-vulnerability-report>`_.
+<https://www.mongodb.com/docs/manual/tutorial/create-a-vulnerability-report/>`_.
 
 Installation
 ============
@@ -88,7 +88,12 @@ is incompatible with PyMongo.
 Dependencies
 ============
 
-PyMongo supports CPython 3.6.2+ and PyPy3.6+.
+PyMongo supports CPython 3.7+ and PyPy3.7+.
+
+Required dependencies:
+
+Support for mongodb+srv:// URIs requires `dnspython
+<https://pypi.python.org/pypi/dnspython>`_
 
 Optional dependencies:
 
@@ -104,10 +109,6 @@ MONGODB-AWS authentication requires `pymongo-auth-aws
 
   $ python -m pip install "pymongo[aws]"
 
-Support for mongodb+srv:// URIs requires `dnspython
-<https://pypi.python.org/pypi/dnspython>`_::
-
-  $ python -m pip install "pymongo[srv]"
 
 OCSP (Online Certificate Status Protocol) requires `PyOpenSSL
 <https://pypi.org/project/pyOpenSSL/>`_, `requests
@@ -129,14 +130,15 @@ Wire protocol compression with zstandard requires `zstandard
   $ python -m pip install "pymongo[zstd]"
 
 Client-Side Field Level Encryption requires `pymongocrypt
-<https://pypi.org/project/pymongocrypt/>`_::
+<https://pypi.org/project/pymongocrypt/>`_ and
+`pymongo-auth-aws <https://pypi.org/project/pymongo-auth-aws/>`_::
 
   $ python -m pip install "pymongo[encryption]"
 
 You can install all dependencies automatically with the following
 command::
 
-  $ python -m pip install "pymongo[gssapi,aws,ocsp,snappy,srv,tls,zstd,encryption]"
+  $ python -m pip install "pymongo[gssapi,aws,ocsp,snappy,zstd,encryption]"
 
 Additional dependencies are:
 
@@ -146,7 +148,7 @@ Examples
 ========
 Here's a basic example (for more see the *examples* section of the docs):
 
-.. code-block:: python
+.. code-block:: pycon
 
   >>> import pymongo
   >>> client = pymongo.MongoClient("localhost", 27017)

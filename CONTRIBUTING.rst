@@ -19,7 +19,7 @@ that might not be of interest or that has already been addressed.
 Supported Interpreters
 ----------------------
 
-PyMongo supports CPython 3.6+ and PyPy3.6+. Language
+PyMongo supports CPython 3.7+ and PyPy3.7+. Language
 features not supported by all interpreters can not be used.
 
 Style Guide
@@ -55,6 +55,10 @@ To run ``pre-commit`` manually, run::
 
     pre-commit run --all-files
 
+To run a manual hook like `flake8` manually, run::
+
+    pre-commit run --all-files --hook-stage manual flake8
+
 Documentation
 -------------
 
@@ -66,8 +70,25 @@ branch and submit a `pull request <https://help.github.com/articles/using-pull-r
 You might also use the GitHub `Edit <https://github.com/blog/844-forking-with-the-edit-button>`_
 button.
 
+Running Tests Locally
+---------------------
+- Ensure you have started the appropriate Mongo Server(s).
+- Run ``python setup.py test`` to run all of the tests.
+- Run ``python setup.py test -s test.<mod_name>.<class_name>.<test_name>`` to
+  run specific tests.  You can omit the ``<test_name>`` to test a full class
+  and the ``<class_name>`` to test a full module.  For example:
+  ``python setup.py test -s test.test_change_stream.TestUnifiedChangeStreamsErrors.test_change_stream_errors_on_ElectionInProgress``.
+
+Running Load Balancer Tests Locally
+-----------------------------------
+- Install ``haproxy`` (available as ``brew install haproxy`` on macOS).
+- Clone ``drivers-evergreen-tools``: ``git clone git@github.com:mongodb-labs/drivers-evergreen-tools.git``.
+- Start the servers using ``LOAD_BALANCER=true TOPOLOGY=sharded_cluster AUTH=noauth SSL=nossl MONGODB_VERSION=6.0 DRIVERS_TOOLS=$PWD/drivers-evergreen-tools MONGO_ORCHESTRATION_HOME=$PWD/drivers-evergreen-tools/.evergreen/orchestration $PWD/drivers-evergreen-tools/.evergreen/run-orchestration.sh``.
+- Start the load balancer using: ``MONGODB_URI='mongodb://localhost:27017,localhost:27018/' $PWD/drivers-evergreen-tools/.evergreen/run-load-balancer.sh start``.
+- Run the tests from the ``pymongo`` checkout directory using: ``LOADBALANCER=1 TEST_LOADBALANCER=1 SINGLE_MONGOS_LB_URI='mongodb://127.0.0.1:8000/?loadBalanced=true' MULTI_MONGOS_LB_URI='mongodb://127.0.0.1:8001/?loadBalanced=true' MONGODB_URI='mongodb://localhost:27017,localhost:27018/' python setup.py test -s test.test_load_balancer``.
+
 Re-sync Spec Tests
------------------
+------------------
 
 If you would like to re-sync the copy of the specification tests in the
 PyMongo repository with that which is inside the `specifications repo

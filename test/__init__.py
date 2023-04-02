@@ -15,11 +15,16 @@
 """Test suite for pymongo, bson, and gridfs.
 """
 
+import base64
 import gc
+import multiprocessing
 import os
+import signal
 import socket
+import subprocess
 import sys
 import threading
+import time
 import traceback
 import unittest
 import warnings
@@ -38,12 +43,12 @@ try:
     HAVE_IPADDRESS = True
 except ImportError:
     HAVE_IPADDRESS = False
-
 from contextlib import contextmanager
 from functools import wraps
 from test.version import Version
-from typing import Dict, no_type_check
+from typing import Any, Callable, Dict, Generator, no_type_check
 from unittest import SkipTest
+from urllib.parse import quote_plus
 
 import pymongo
 import pymongo.errors
@@ -113,6 +118,27 @@ elif TEST_SERVERLESS:
     TLS_OPTIONS = {"tls": True}
     # Spec says serverless tests must be run with compression.
     COMPRESSORS = COMPRESSORS or "zlib"
+
+
+# Shared KMS data.
+LOCAL_MASTER_KEY = base64.b64decode(
+    b"Mng0NCt4ZHVUYUJCa1kxNkVyNUR1QURhZ2h2UzR2d2RrZzh0cFBwM3R6NmdWMDFBMUN3YkQ"
+    b"5aXRRMkhGRGdQV09wOGVNYUMxT2k3NjZKelhaQmRCZGJkTXVyZG9uSjFk"
+)
+AWS_CREDS = {
+    "accessKeyId": os.environ.get("FLE_AWS_KEY", ""),
+    "secretAccessKey": os.environ.get("FLE_AWS_SECRET", ""),
+}
+AZURE_CREDS = {
+    "tenantId": os.environ.get("FLE_AZURE_TENANTID", ""),
+    "clientId": os.environ.get("FLE_AZURE_CLIENTID", ""),
+    "clientSecret": os.environ.get("FLE_AZURE_CLIENTSECRET", ""),
+}
+GCP_CREDS = {
+    "email": os.environ.get("FLE_GCP_EMAIL", ""),
+    "privateKey": os.environ.get("FLE_GCP_PRIVATEKEY", ""),
+}
+KMIP_CREDS = {"endpoint": os.environ.get("FLE_KMIP_ENDPOINT", "localhost:5698")}
 
 
 def is_server_resolvable():
@@ -280,6 +306,23 @@ class ClientContext(object):
         return opts
 
     @property
+    def uri(self):
+        """Return the MongoClient URI for creating a duplicate client."""
+        opts = client_context.default_client_options.copy()
+        opts.pop("server_api", None)  # Cannot be set from the URI
+        opts_parts = []
+        for opt, val in opts.items():
+            strval = str(val)
+            if isinstance(val, bool):
+                strval = strval.lower()
+            opts_parts.append(f"{opt}={quote_plus(strval)}")
+        opts_part = "&".join(opts_parts)
+        auth_part = ""
+        if client_context.auth_enabled:
+            auth_part = f"{quote_plus(db_user)}:{quote_plus(db_pwd)}@"
+        return f"mongodb://{auth_part}{self.pair}/?{opts_part}"
+
+    @property
     def hello(self):
         if not self._hello:
             self._hello = self.client.admin.command(HelloCompat.LEGACY_CMD)
@@ -287,7 +330,9 @@ class ClientContext(object):
 
     def _connect(self, host, port, **kwargs):
         kwargs.update(self.default_client_options)
-        client = pymongo.MongoClient(host, port, serverSelectionTimeoutMS=5000, **kwargs)
+        client: MongoClient = pymongo.MongoClient(
+            host, port, serverSelectionTimeoutMS=5000, **kwargs
+        )
         try:
             try:
                 client.admin.command(HelloCompat.LEGACY_CMD)  # Can we connect?
@@ -312,7 +357,7 @@ class ClientContext(object):
         if self.client is not None:
             # Return early when connected to dataLake as mongohoused does not
             # support the getCmdLineOpts command and is tested without TLS.
-            build_info = self.client.admin.command("buildInfo")
+            build_info: Any = self.client.admin.command("buildInfo")
             if "dataLake" in build_info:
                 self.is_data_lake = True
                 self.auth_enabled = True
@@ -359,7 +404,7 @@ class ClientContext(object):
                     username=db_user,
                     password=db_pwd,
                     replicaSet=self.replica_set_name,
-                    **self.default_client_options
+                    **self.default_client_options,
                 )
 
                 # May not have this if OperationFailure was raised earlier.
@@ -387,7 +432,7 @@ class ClientContext(object):
                         username=db_user,
                         password=db_pwd,
                         replicaSet=self.replica_set_name,
-                        **self.default_client_options
+                        **self.default_client_options,
                     )
                 else:
                     self.client = pymongo.MongoClient(
@@ -477,20 +522,22 @@ class ClientContext(object):
     @property
     def storage_engine(self):
         try:
-            return self.server_status.get("storageEngine", {}).get("name")
+            return self.server_status.get("storageEngine", {}).get(  # type:ignore[union-attr]
+                "name"
+            )
         except AttributeError:
             # Raised if self.server_status is None.
             return None
 
     def _check_user_provided(self):
         """Return True if db_user/db_password is already an admin user."""
-        client = pymongo.MongoClient(
+        client: MongoClient = pymongo.MongoClient(
             host,
             port,
             username=db_user,
             password=db_pwd,
             serverSelectionTimeoutMS=100,
-            **self.default_client_options
+            **self.default_client_options,
         )
 
         try:
@@ -650,7 +697,7 @@ class ClientContext(object):
         if self.has_secondaries:
             return True
         if self.is_mongos:
-            shard = self.client.config.shards.find_one()["host"]
+            shard = self.client.config.shards.find_one()["host"]  # type:ignore[index]
             num_members = shard.count(",") + 1
             return num_members > 1
         return False
@@ -718,6 +765,16 @@ class ClientContext(object):
         return self._require(
             lambda: not self.load_balancer, "Must not be connected to a load balancer", func=func
         )
+
+    def require_no_serverless(self, func):
+        """Run a test only if the client is not connected to serverless."""
+        return self._require(
+            lambda: not self.serverless, "Must not be connected to serverless", func=func
+        )
+
+    def require_change_streams(self, func):
+        """Run a test only if the server supports change streams."""
+        return self.require_no_mmap(self.require_no_standalone(self.require_no_serverless(func)))
 
     def is_topology_type(self, topologies):
         unknown = set(topologies) - {
@@ -948,11 +1005,92 @@ class PyMongoTestCase(unittest.TestCase):
                 "configureFailPoint", cmd_on["configureFailPoint"], mode="off"
             )
 
+    @contextmanager
+    def fork(
+        self, target: Callable, timeout: float = 60
+    ) -> Generator[multiprocessing.Process, None, None]:
+        """Helper for tests that use os.fork()
+
+        Use in a with statement:
+
+            with self.fork(target=lambda: print('in child')) as proc:
+                self.assertTrue(proc.pid)  # Child process was started
+        """
+
+        def _print_threads(*args: object) -> None:
+            if _print_threads.called:  # type:ignore[attr-defined]
+                return
+            _print_threads.called = True  # type:ignore[attr-defined]
+            print_thread_tracebacks()
+
+        _print_threads.called = False  # type:ignore[attr-defined]
+
+        def _target() -> None:
+            signal.signal(signal.SIGUSR1, _print_threads)
+            try:
+                target()
+            except Exception as exc:
+                sys.stderr.write(f"Child process failed with: {exc}\n")
+                _print_threads()
+                # Sleep for a while to let the parent attach via GDB.
+                time.sleep(2 * timeout)
+                raise
+
+        ctx = multiprocessing.get_context("fork")
+        proc = ctx.Process(target=_target)
+        proc.start()
+        try:
+            yield proc  # type: ignore
+        finally:
+            proc.join(timeout)
+            pid = proc.pid
+            assert pid
+            if proc.exitcode is None:
+                # gdb to get C-level tracebacks
+                print_thread_stacks(pid)
+                # If it failed, SIGUSR1 to get thread tracebacks.
+                os.kill(pid, signal.SIGUSR1)
+                proc.join(5)
+                if proc.exitcode is None:
+                    # SIGINT to get main thread traceback in case SIGUSR1 didn't work.
+                    os.kill(pid, signal.SIGINT)
+                    proc.join(5)
+                if proc.exitcode is None:
+                    # SIGKILL in case SIGINT didn't work.
+                    proc.kill()
+                    proc.join(1)
+                self.fail(f"child timed out after {timeout}s (see traceback in logs): deadlock?")
+            self.assertEqual(proc.exitcode, 0)
+
+
+def print_thread_tracebacks() -> None:
+    """Print all Python thread tracebacks."""
+    for thread_id, frame in sys._current_frames().items():
+        sys.stderr.write(f"\n--- Traceback for thread {thread_id} ---\n")
+        traceback.print_stack(frame, file=sys.stderr)
+
+
+def print_thread_stacks(pid: int) -> None:
+    """Print all C-level thread stacks for a given process id."""
+    if sys.platform == "darwin":
+        cmd = ["lldb", "--attach-pid", f"{pid}", "--batch", "--one-line", '"thread backtrace all"']
+    else:
+        cmd = ["gdb", f"--pid={pid}", "--batch", '--eval-command="thread apply all bt"']
+
+    try:
+        res = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8"
+        )
+    except Exception as exc:
+        sys.stderr.write(f"Could not print C-level thread stacks because {cmd[0]} failed: {exc}")
+    else:
+        sys.stderr.write(res.stdout)
+
 
 class IntegrationTest(PyMongoTestCase):
     """Base class for TestCases that need a connection to MongoDB to pass."""
 
-    client: MongoClient
+    client: MongoClient[dict]
     db: Database
     credentials: Dict[str, str]
 
@@ -1011,10 +1149,15 @@ class MockClientTest(unittest.TestCase):
         super(MockClientTest, self).tearDown()
 
 
+# Global knobs to speed up the test suite.
+global_knobs = client_knobs(events_queue_frequency=0.05)
+
+
 def setup():
     client_context.init()
     warnings.resetwarnings()
     warnings.simplefilter("always")
+    global_knobs.enable()
 
 
 def _get_executors(topology):
@@ -1068,6 +1211,7 @@ def print_running_clients():
 
 
 def teardown():
+    global_knobs.disable()
     garbage = []
     for g in gc.garbage:
         garbage.append("GARBAGE: %r" % (g,))

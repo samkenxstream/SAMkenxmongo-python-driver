@@ -29,7 +29,9 @@ Example usage (deserialization):
 .. doctest::
 
    >>> from bson.json_util import loads
-   >>> loads('[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$scope": {}, "$code": "function x() { return 1; }"}}, {"bin": {"$type": "80", "$binary": "AQIDBA=="}}]')
+   >>> loads(
+   ...     '[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$scope": {}, "$code": "function x() { return 1; }"}}, {"bin": {"$type": "80", "$binary": "AQIDBA=="}}]'
+   ... )
    [{'foo': [1, 2]}, {'bar': {'hello': 'world'}}, {'code': Code('function x() { return 1; }', {})}, {'bin': Binary(b'...', 128)}]
 
 Example usage with :const:`RELAXED_JSON_OPTIONS` (the default):
@@ -38,10 +40,14 @@ Example usage with :const:`RELAXED_JSON_OPTIONS` (the default):
 
    >>> from bson import Binary, Code
    >>> from bson.json_util import dumps
-   >>> dumps([{'foo': [1, 2]},
-   ...        {'bar': {'hello': 'world'}},
-   ...        {'code': Code("function x() { return 1; }")},
-   ...        {'bin': Binary(b"\x01\x02\x03\x04")}])
+   >>> dumps(
+   ...     [
+   ...         {"foo": [1, 2]},
+   ...         {"bar": {"hello": "world"}},
+   ...         {"code": Code("function x() { return 1; }")},
+   ...         {"bin": Binary(b"\x01\x02\x03\x04")},
+   ...     ]
+   ... )
    '[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$code": "function x() { return 1; }"}}, {"bin": {"$binary": {"base64": "AQIDBA==", "subType": "00"}}}]'
 
 Example usage (with :const:`CANONICAL_JSON_OPTIONS`):
@@ -50,11 +56,15 @@ Example usage (with :const:`CANONICAL_JSON_OPTIONS`):
 
    >>> from bson import Binary, Code
    >>> from bson.json_util import dumps, CANONICAL_JSON_OPTIONS
-   >>> dumps([{'foo': [1, 2]},
-   ...        {'bar': {'hello': 'world'}},
-   ...        {'code': Code("function x() { return 1; }")},
-   ...        {'bin': Binary(b"\x01\x02\x03\x04")}],
-   ...       json_options=CANONICAL_JSON_OPTIONS)
+   >>> dumps(
+   ...     [
+   ...         {"foo": [1, 2]},
+   ...         {"bar": {"hello": "world"}},
+   ...         {"code": Code("function x() { return 1; }")},
+   ...         {"bin": Binary(b"\x01\x02\x03\x04")},
+   ...     ],
+   ...     json_options=CANONICAL_JSON_OPTIONS,
+   ... )
    '[{"foo": [{"$numberInt": "1"}, {"$numberInt": "2"}]}, {"bar": {"hello": "world"}}, {"code": {"$code": "function x() { return 1; }"}}, {"bin": {"$binary": {"base64": "AQIDBA==", "subType": "00"}}}]'
 
 Example usage (with :const:`LEGACY_JSON_OPTIONS`):
@@ -63,11 +73,15 @@ Example usage (with :const:`LEGACY_JSON_OPTIONS`):
 
    >>> from bson import Binary, Code
    >>> from bson.json_util import dumps, LEGACY_JSON_OPTIONS
-   >>> dumps([{'foo': [1, 2]},
-   ...        {'bar': {'hello': 'world'}},
-   ...        {'code': Code("function x() { return 1; }", {})},
-   ...        {'bin': Binary(b"\x01\x02\x03\x04")}],
-   ...       json_options=LEGACY_JSON_OPTIONS)
+   >>> dumps(
+   ...     [
+   ...         {"foo": [1, 2]},
+   ...         {"bar": {"hello": "world"}},
+   ...         {"code": Code("function x() { return 1; }", {})},
+   ...         {"bin": Binary(b"\x01\x02\x03\x04")},
+   ...     ],
+   ...     json_options=LEGACY_JSON_OPTIONS,
+   ... )
    '[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$code": "function x() { return 1; }", "$scope": {}}}, {"bin": {"$binary": "AQIDBA==", "$type": "00"}}]'
 
 Alternatively, you can manually pass the `default` to :func:`json.dumps`.
@@ -94,11 +108,16 @@ import re
 import uuid
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Type, Union, cast
 
-import bson
-from bson import EPOCH_AWARE
 from bson.binary import ALL_UUID_SUBTYPES, UUID_SUBTYPE, Binary, UuidRepresentation
 from bson.code import Code
-from bson.codec_options import CodecOptions
+from bson.codec_options import CodecOptions, DatetimeConversion
+from bson.datetime_ms import (
+    EPOCH_AWARE,
+    DatetimeMS,
+    _datetime_to_millis,
+    _max_datetime_ms,
+    _millis_to_datetime,
+)
 from bson.dbref import DBRef
 from bson.decimal128 import Decimal128
 from bson.int64 import Int64
@@ -200,57 +219,67 @@ class JSONMode:
 
 
 class JSONOptions(CodecOptions):
-    """Encapsulates JSON options for :func:`dumps` and :func:`loads`.
-
-    :Parameters:
-      - `strict_number_long`: If ``True``, :class:`~bson.int64.Int64` objects
-        are encoded to MongoDB Extended JSON's *Strict mode* type
-        `NumberLong`, ie ``'{"$numberLong": "<number>" }'``. Otherwise they
-        will be encoded as an `int`. Defaults to ``False``.
-      - `datetime_representation`: The representation to use when encoding
-        instances of :class:`datetime.datetime`. Defaults to
-        :const:`~DatetimeRepresentation.LEGACY`.
-      - `strict_uuid`: If ``True``, :class:`uuid.UUID` object are encoded to
-        MongoDB Extended JSON's *Strict mode* type `Binary`. Otherwise it
-        will be encoded as ``'{"$uuid": "<hex>" }'``. Defaults to ``False``.
-      - `json_mode`: The :class:`JSONMode` to use when encoding BSON types to
-        Extended JSON. Defaults to :const:`~JSONMode.LEGACY`.
-      - `document_class`: BSON documents returned by :func:`loads` will be
-        decoded to an instance of this class. Must be a subclass of
-        :class:`collections.MutableMapping`. Defaults to :class:`dict`.
-      - `uuid_representation`: The :class:`~bson.binary.UuidRepresentation`
-        to use when encoding and decoding instances of :class:`uuid.UUID`.
-        Defaults to :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
-      - `tz_aware`: If ``True``, MongoDB Extended JSON's *Strict mode* type
-        `Date` will be decoded to timezone aware instances of
-        :class:`datetime.datetime`. Otherwise they will be naive. Defaults
-        to ``False``.
-      - `tzinfo`: A :class:`datetime.tzinfo` subclass that specifies the
-        timezone from which :class:`~datetime.datetime` objects should be
-        decoded. Defaults to :const:`~bson.tz_util.utc`.
-      - `args`: arguments to :class:`~bson.codec_options.CodecOptions`
-      - `kwargs`: arguments to :class:`~bson.codec_options.CodecOptions`
-
-    .. seealso:: The specification for Relaxed and Canonical `Extended JSON`_.
-
-    .. versionchanged:: 4.0
-       The default for `json_mode` was changed from :const:`JSONMode.LEGACY`
-       to :const:`JSONMode.RELAXED`.
-       The default for `uuid_representation` was changed from
-       :const:`~bson.binary.UuidRepresentation.PYTHON_LEGACY` to
-       :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
-
-    .. versionchanged:: 3.5
-       Accepts the optional parameter `json_mode`.
-
-    .. versionchanged:: 4.0
-       Changed default value of `tz_aware` to False.
-    """
-
     json_mode: int
     strict_number_long: bool
     datetime_representation: int
     strict_uuid: bool
+
+    def __init__(self, *args, **kwargs):
+        """Encapsulates JSON options for :func:`dumps` and :func:`loads`.
+
+        :Parameters:
+          - `strict_number_long`: If ``True``, :class:`~bson.int64.Int64` objects
+            are encoded to MongoDB Extended JSON's *Strict mode* type
+            `NumberLong`, ie ``'{"$numberLong": "<number>" }'``. Otherwise they
+            will be encoded as an `int`. Defaults to ``False``.
+          - `datetime_representation`: The representation to use when encoding
+            instances of :class:`datetime.datetime`. Defaults to
+            :const:`~DatetimeRepresentation.LEGACY`.
+          - `strict_uuid`: If ``True``, :class:`uuid.UUID` object are encoded to
+            MongoDB Extended JSON's *Strict mode* type `Binary`. Otherwise it
+            will be encoded as ``'{"$uuid": "<hex>" }'``. Defaults to ``False``.
+          - `json_mode`: The :class:`JSONMode` to use when encoding BSON types to
+            Extended JSON. Defaults to :const:`~JSONMode.LEGACY`.
+          - `document_class`: BSON documents returned by :func:`loads` will be
+            decoded to an instance of this class. Must be a subclass of
+            :class:`collections.MutableMapping`. Defaults to :class:`dict`.
+          - `uuid_representation`: The :class:`~bson.binary.UuidRepresentation`
+            to use when encoding and decoding instances of :class:`uuid.UUID`.
+            Defaults to :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
+          - `tz_aware`: If ``True``, MongoDB Extended JSON's *Strict mode* type
+            `Date` will be decoded to timezone aware instances of
+            :class:`datetime.datetime`. Otherwise they will be naive. Defaults
+            to ``False``.
+          - `tzinfo`: A :class:`datetime.tzinfo` subclass that specifies the
+            timezone from which :class:`~datetime.datetime` objects should be
+            decoded. Defaults to :const:`~bson.tz_util.utc`.
+          - `datetime_conversion`: Specifies how UTC datetimes should be decoded
+            within BSON. Valid options include 'datetime_ms' to return as a
+            DatetimeMS, 'datetime' to return as a datetime.datetime and
+            raising a ValueError for out-of-range values, 'datetime_auto' to
+            return DatetimeMS objects when the underlying datetime is
+            out-of-range and 'datetime_clamp' to clamp to the minimum and
+            maximum possible datetimes. Defaults to 'datetime'. See
+            :ref:`handling-out-of-range-datetimes` for details.
+          - `args`: arguments to :class:`~bson.codec_options.CodecOptions`
+          - `kwargs`: arguments to :class:`~bson.codec_options.CodecOptions`
+
+        .. seealso:: The specification for Relaxed and Canonical `Extended JSON`_.
+
+        .. versionchanged:: 4.0
+           The default for `json_mode` was changed from :const:`JSONMode.LEGACY`
+           to :const:`JSONMode.RELAXED`.
+           The default for `uuid_representation` was changed from
+           :const:`~bson.binary.UuidRepresentation.PYTHON_LEGACY` to
+           :const:`~bson.binary.UuidRepresentation.UNSPECIFIED`.
+
+        .. versionchanged:: 3.5
+           Accepts the optional parameter `json_mode`.
+
+        .. versionchanged:: 4.0
+           Changed default value of `tz_aware` to False.
+        """
+        super().__init__()
 
     def __new__(
         cls: Type["JSONOptions"],
@@ -425,7 +454,7 @@ def dumps(obj: Any, *args: Any, **kwargs: Any) -> str:
     return json.dumps(_json_convert(obj, json_options), *args, **kwargs)
 
 
-def loads(s: str, *args: Any, **kwargs: Any) -> Any:
+def loads(s: Union[str, bytes, bytearray], *args: Any, **kwargs: Any) -> Any:
     """Helper function that wraps :func:`json.loads`.
 
     Automatically passes the object_hook for BSON type conversion.
@@ -437,6 +466,11 @@ def loads(s: str, *args: Any, **kwargs: Any) -> Any:
       - `json_options`: A :class:`JSONOptions` instance used to modify the
         decoding of MongoDB Extended JSON types. Defaults to
         :const:`DEFAULT_JSON_OPTIONS`.
+
+    .. versionchanged:: 4.0
+       Now loads :class:`datetime.datetime` instances as naive by default. To
+       load timezone aware instances utilize the `json_options` parameter.
+       See :ref:`tz_aware_default_change` for an example.
 
     .. versionchanged:: 3.5
        Parses Relaxed and Canonical Extended JSON as well as PyMongo's legacy
@@ -589,7 +623,9 @@ def _parse_canonical_binary(doc: Any, json_options: JSONOptions) -> Union[Binary
     return _binary_or_uuid(data, int(subtype, 16), json_options)
 
 
-def _parse_canonical_datetime(doc: Any, json_options: JSONOptions) -> datetime.datetime:
+def _parse_canonical_datetime(
+    doc: Any, json_options: JSONOptions
+) -> Union[datetime.datetime, DatetimeMS]:
     """Decode a JSON datetime to python datetime.datetime."""
     dtm = doc["$date"]
     if len(doc) != 1:
@@ -642,10 +678,15 @@ def _parse_canonical_datetime(doc: Any, json_options: JSONOptions) -> datetime.d
         if json_options.tz_aware:
             if json_options.tzinfo:
                 aware = aware.astimezone(json_options.tzinfo)
+            if json_options.datetime_conversion == DatetimeConversion.DATETIME_MS:
+                return DatetimeMS(aware)
             return aware
         else:
-            return aware.replace(tzinfo=None)
-    return bson._millis_to_datetime(int(dtm), json_options)
+            aware_tzinfo_none = aware.replace(tzinfo=None)
+            if json_options.datetime_conversion == DatetimeConversion.DATETIME_MS:
+                return DatetimeMS(aware_tzinfo_none)
+            return aware_tzinfo_none
+    return _millis_to_datetime(int(dtm), json_options)
 
 
 def _parse_canonical_oid(doc: Any) -> ObjectId:
@@ -801,10 +842,19 @@ def default(obj: Any, json_options: JSONOptions = DEFAULT_JSON_OPTIONS) -> Any:
                     "$date": "%s%s%s" % (obj.strftime("%Y-%m-%dT%H:%M:%S"), fracsecs, tz_string)
                 }
 
-        millis = bson._datetime_to_millis(obj)
+        millis = _datetime_to_millis(obj)
         if json_options.datetime_representation == DatetimeRepresentation.LEGACY:
             return {"$date": millis}
         return {"$date": {"$numberLong": str(millis)}}
+    if isinstance(obj, DatetimeMS):
+        if (
+            json_options.datetime_representation == DatetimeRepresentation.ISO8601
+            and 0 <= int(obj) <= _max_datetime_ms()
+        ):
+            return default(obj.as_datetime(), json_options)
+        elif json_options.datetime_representation == DatetimeRepresentation.LEGACY:
+            return {"$date": str(int(obj))}
+        return {"$date": {"$numberLong": str(int(obj))}}
     if json_options.strict_number_long and isinstance(obj, Int64):
         return {"$numberLong": str(obj)}
     if isinstance(obj, (RE_TYPE, Regex)):

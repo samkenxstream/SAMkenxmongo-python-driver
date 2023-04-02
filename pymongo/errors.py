@@ -52,6 +52,14 @@ class PyMongoError(Exception):
         """Remove the given label from this error."""
         self._error_labels.discard(label)
 
+    @property
+    def timeout(self) -> bool:
+        """True if this error was caused by a timeout.
+
+        .. versionadded:: 4.2
+        """
+        return False
+
 
 class ProtocolError(PyMongoError):
     """Raised for failures related to the wire protocol."""
@@ -59,6 +67,19 @@ class ProtocolError(PyMongoError):
 
 class ConnectionFailure(PyMongoError):
     """Raised when a connection to the database cannot be made or is lost."""
+
+
+class WaitQueueTimeoutError(ConnectionFailure):
+    """Raised when an operation times out waiting to checkout a connection from the pool.
+
+    Subclass of :exc:`~pymongo.errors.ConnectionFailure`.
+
+    .. versionadded:: 4.2
+    """
+
+    @property
+    def timeout(self) -> bool:
+        return True
 
 
 class AutoReconnect(ConnectionFailure):
@@ -96,6 +117,10 @@ class NetworkTimeout(AutoReconnect):
 
     Subclass of :exc:`~pymongo.errors.AutoReconnect`.
     """
+
+    @property
+    def timeout(self) -> bool:
+        return True
 
 
 def _format_detailed_error(message, details):
@@ -139,6 +164,10 @@ class ServerSelectionTimeoutError(AutoReconnect):
     within the timeout window, or if you attempt to query with a Read
     Preference that the replica set cannot satisfy.
     """
+
+    @property
+    def timeout(self) -> bool:
+        return True
 
 
 class ConfigurationError(PyMongoError):
@@ -190,6 +219,10 @@ class OperationFailure(PyMongoError):
         """
         return self.__details
 
+    @property
+    def timeout(self) -> bool:
+        return self.__code in (50,)
+
 
 class CursorNotFound(OperationFailure):
     """Raised while iterating query results if the cursor is
@@ -207,6 +240,10 @@ class ExecutionTimeout(OperationFailure):
 
     .. versionadded:: 2.7
     """
+
+    @property
+    def timeout(self) -> bool:
+        return True
 
 
 class WriteConcernError(OperationFailure):
@@ -233,9 +270,18 @@ class WTimeoutError(WriteConcernError):
     .. versionadded:: 2.7
     """
 
+    @property
+    def timeout(self) -> bool:
+        return True
+
 
 class DuplicateKeyError(WriteError):
     """Raised when an insert or update fails due to a duplicate key error."""
+
+
+def _wtimeout_error(error: Any) -> bool:
+    """Return True if this writeConcernError doc is a caused by a timeout."""
+    return error.get("code") == 50 or ("errInfo" in error and error["errInfo"].get("wtimeout"))
 
 
 class BulkWriteError(OperationFailure):
@@ -251,6 +297,19 @@ class BulkWriteError(OperationFailure):
 
     def __reduce__(self) -> Tuple[Any, Any]:
         return self.__class__, (self.details,)
+
+    @property
+    def timeout(self) -> bool:
+        # Check the last writeConcernError and last writeError to determine if this
+        # BulkWriteError was caused by a timeout.
+        wces = self.details.get("writeConcernErrors", [])
+        if wces and _wtimeout_error(wces[-1]):
+            return True
+
+        werrs = self.details.get("writeErrors", [])
+        if werrs and werrs[-1].get("code") == 50:
+            return True
+        return False
 
 
 class InvalidOperation(PyMongoError):
@@ -292,6 +351,37 @@ class EncryptionError(PyMongoError):
     def cause(self) -> Exception:
         """The exception that caused this encryption or decryption error."""
         return self.__cause
+
+    @property
+    def timeout(self) -> bool:
+        if isinstance(self.__cause, PyMongoError):
+            return self.__cause.timeout
+        return False
+
+
+class EncryptedCollectionError(EncryptionError):
+    """Raised when creating a collection with encrypted_fields fails.
+
+    .. note:: EncryptedCollectionError and `create_encrypted_collection` are both part of the
+       Queryable Encryption beta. Backwards-breaking changes may be made before the final release.
+
+    .. versionadded:: 4.4
+    """
+
+    def __init__(self, cause: Exception, encrypted_fields: Mapping[str, Any]) -> None:
+        super(EncryptedCollectionError, self).__init__(cause)
+        self.__encrypted_fields = encrypted_fields
+
+    @property
+    def encrypted_fields(self) -> Mapping[str, Any]:
+        """The encrypted_fields document that allows inferring which data keys are *known* to be created.
+
+        Note that the returned document is not guaranteed to contain information about *all* of the data keys that
+        were created, for example in the case of an indefinite error like a timeout. Use the `cause` property to
+        determine whether a definite or indefinite error caused this error, and only rely on the accuracy of the
+        encrypted_fields if the error is definite.
+        """
+        return self.__encrypted_fields
 
 
 class _OperationCancelled(AutoReconnect):

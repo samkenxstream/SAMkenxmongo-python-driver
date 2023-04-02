@@ -30,6 +30,7 @@ from pymongo.errors import (
     WriteConcernError,
     WriteError,
     WTimeoutError,
+    _wtimeout_error,
 )
 from pymongo.hello import HelloCompat
 
@@ -43,7 +44,7 @@ _SHUTDOWN_CODES = frozenset(
 # From the SDAM spec, the "not primary" error codes are combined with the
 # "node is recovering" error codes (of which the "node is shutting down"
 # errors are a subset).
-_NOT_PRIMARY_CODES = (
+_NOT_PRIMARY_CODES: frozenset = (
     frozenset(
         [
             10058,  # LegacyNotPrimary <=3.2 "not primary" error code
@@ -57,7 +58,7 @@ _NOT_PRIMARY_CODES = (
     | _SHUTDOWN_CODES
 )
 # From the retryable writes spec.
-_RETRYABLE_ERROR_CODES = _NOT_PRIMARY_CODES | frozenset(
+_RETRYABLE_ERROR_CODES: frozenset = _NOT_PRIMARY_CODES | frozenset(
     [
         7,  # HostNotFound
         6,  # HostUnreachable
@@ -79,6 +80,8 @@ def _index_list(key_or_list, direction=None):
     Takes such a list, or a single key, or a single key and direction.
     """
     if direction is not None:
+        if not isinstance(key_or_list, str):
+            raise TypeError("Expected a string and a direction")
         return [(key_or_list, direction)]
     else:
         if isinstance(key_or_list, str):
@@ -87,7 +90,12 @@ def _index_list(key_or_list, direction=None):
             return list(key_or_list)
         elif not isinstance(key_or_list, (list, tuple)):
             raise TypeError("if no direction is specified, key_or_list must be an instance of list")
-        return key_or_list
+        values = []
+        for item in key_or_list:
+            if isinstance(item, str):
+                item = (item, ASCENDING)
+            values.append(item)
+        return values
 
 
 def _index_document(index_list):
@@ -107,7 +115,10 @@ def _index_document(index_list):
         raise ValueError("key_or_list must not be the empty list")
 
     index: SON[str, Any] = SON()
-    for (key, value) in index_list:
+    for item in index_list:
+        if isinstance(item, str):
+            item = (item, ASCENDING)
+        key, value = item
         if not isinstance(key, str):
             raise TypeError("first item in each key pair must be an instance of str")
         if not isinstance(value, (str, int, abc.Mapping)):
@@ -190,7 +201,7 @@ def _raise_last_write_error(write_errors: List[Any]) -> NoReturn:
 
 
 def _raise_write_concern_error(error: Any) -> NoReturn:
-    if "errInfo" in error and error["errInfo"].get("wtimeout"):
+    if _wtimeout_error(error):
         # Make sure we raise WTimeoutError
         raise WTimeoutError(error.get("errmsg"), error.get("code"), error)
     raise WriteConcernError(error.get("errmsg"), error.get("code"), error)

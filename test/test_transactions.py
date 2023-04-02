@@ -30,9 +30,13 @@ from test.utils import (
 )
 from test.utils_spec_runner import SpecRunner
 
+from bson import encode
+from bson.raw_bson import RawBSONDocument
 from gridfs import GridFS, GridFSBucket
 from pymongo import WriteConcern, client_session
 from pymongo.client_session import TransactionOptions
+from pymongo.command_cursor import CommandCursor
+from pymongo.cursor import Cursor
 from pymongo.errors import (
     CollectionInvalid,
     ConfigurationError,
@@ -330,24 +334,60 @@ class TestTransactions(TransactionsBase):
         listener.reset()
         self.addCleanup(client.close)
         self.addCleanup(coll.drop)
-        large_str = "\0" * (10 * 1024 * 1024)
-        ops = [InsertOne({"a": large_str}) for _ in range(10)]
+        large_str = "\0" * (1 * 1024 * 1024)
+        ops = [InsertOne(RawBSONDocument(encode({"a": large_str}))) for _ in range(48)]
         with client.start_session() as session:
             with session.start_transaction():
                 coll.bulk_write(ops, session=session)
         # Assert commands were constructed properly.
         self.assertEqual(
-            ["insert", "insert", "insert", "commitTransaction"], listener.started_command_names()
+            ["insert", "insert", "commitTransaction"], listener.started_command_names()
         )
-        first_cmd = listener.results["started"][0].command
+        first_cmd = listener.started_events[0].command
         self.assertTrue(first_cmd["startTransaction"])
         lsid = first_cmd["lsid"]
         txn_number = first_cmd["txnNumber"]
-        for event in listener.results["started"][1:]:
+        for event in listener.started_events[1:]:
             self.assertNotIn("startTransaction", event.command)
             self.assertEqual(lsid, event.command["lsid"])
             self.assertEqual(txn_number, event.command["txnNumber"])
-        self.assertEqual(10, coll.count_documents({}))
+        self.assertEqual(48, coll.count_documents({}))
+
+    @client_context.require_transactions
+    def test_transaction_direct_connection(self):
+        client = single_client()
+        self.addCleanup(client.close)
+        coll = client.pymongo_test.test
+
+        # Make sure the collection exists.
+        coll.insert_one({})
+        self.assertEqual(client.topology_description.topology_type_name, "Single")
+        ops = [
+            (coll.bulk_write, [[InsertOne[dict]({})]]),
+            (coll.insert_one, [{}]),
+            (coll.insert_many, [[{}, {}]]),
+            (coll.replace_one, [{}, {}]),
+            (coll.update_one, [{}, {"$set": {"a": 1}}]),
+            (coll.update_many, [{}, {"$set": {"a": 1}}]),
+            (coll.delete_one, [{}]),
+            (coll.delete_many, [{}]),
+            (coll.find_one_and_replace, [{}, {}]),
+            (coll.find_one_and_update, [{}, {"$set": {"a": 1}}]),
+            (coll.find_one_and_delete, [{}, {}]),
+            (coll.find_one, [{}]),
+            (coll.count_documents, [{}]),
+            (coll.distinct, ["foo"]),
+            (coll.aggregate, [[]]),
+            (coll.find, [{}]),
+            (coll.aggregate_raw_batches, [[]]),
+            (coll.find_raw_batches, [{}]),
+            (coll.database.command, ["find", coll.name]),
+        ]
+        for f, args in ops:
+            with client.start_session() as s, s.start_transaction():
+                res = f(*args, session=s)  # type:ignore[operator]
+                if isinstance(res, (CommandCursor, Cursor)):
+                    list(res)
 
 
 class PatchSessionTimeout(object):
@@ -419,7 +459,7 @@ class TestTransactionsConvenientAPI(TransactionsBase):
 
         # Create the collection.
         coll.insert_one({})
-        listener.results.clear()
+        listener.reset()
         with client.start_session() as s:
             with PatchSessionTimeout(0):
                 with self.assertRaises(OperationFailure):
@@ -451,7 +491,7 @@ class TestTransactionsConvenientAPI(TransactionsBase):
             }
         )
         self.addCleanup(self.set_fail_point, {"configureFailPoint": "failCommand", "mode": "off"})
-        listener.results.clear()
+        listener.reset()
 
         with client.start_session() as s:
             with PatchSessionTimeout(0):
@@ -481,7 +521,7 @@ class TestTransactionsConvenientAPI(TransactionsBase):
             }
         )
         self.addCleanup(self.set_fail_point, {"configureFailPoint": "failCommand", "mode": "off"})
-        listener.results.clear()
+        listener.reset()
 
         with client.start_session() as s:
             with PatchSessionTimeout(0):

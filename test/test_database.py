@@ -16,7 +16,7 @@
 
 import re
 import sys
-from typing import Any, List, Mapping
+from typing import Any, Iterable, List, Mapping, Union
 
 sys.path[0:0] = [""]
 
@@ -94,7 +94,26 @@ class TestDatabaseNoConnect(unittest.TestCase):
         self.assertIn("has no attribute '_does_not_exist'", str(context.exception))
 
     def test_iteration(self):
-        self.assertRaises(TypeError, next, self.client.pymongo_test)
+        db = self.client.pymongo_test
+        if "PyPy" in sys.version and sys.version_info < (3, 8, 15):
+            msg = "'NoneType' object is not callable"
+        else:
+            msg = "'Database' object is not iterable"
+        # Iteration fails
+        with self.assertRaisesRegex(TypeError, msg):
+            for _ in db:  # type: ignore[misc] # error: "None" not callable  [misc]
+                break
+        # Index fails
+        with self.assertRaises(TypeError):
+            _ = db[0]
+        # next fails
+        with self.assertRaisesRegex(TypeError, "'Database' object is not iterable"):
+            _ = next(db)
+        # .next() fails
+        with self.assertRaisesRegex(TypeError, "'Database' object is not iterable"):
+            _ = db.next()
+        # Do not implement typing.Iterable.
+        self.assertNotIsInstance(db, Iterable)
 
 
 class TestDatabase(IntegrationTest):
@@ -174,7 +193,6 @@ class TestDatabase(IntegrationTest):
 
     def test_list_collection_names_filter(self):
         listener = OvertCommandListener()
-        results = listener.results
         client = rs_or_single_client(event_listeners=[listener])
         db = client[self.db.name]
         db.capped.drop()
@@ -182,24 +200,37 @@ class TestDatabase(IntegrationTest):
         db.capped.insert_one({})
         db.non_capped.insert_one({})
         self.addCleanup(client.drop_database, db.name)
-
+        filter: Union[None, dict]
         # Should not send nameOnly.
         for filter in ({"options.capped": True}, {"options.capped": True, "name": "capped"}):
-            results.clear()
+            listener.reset()
             names = db.list_collection_names(filter=filter)
             self.assertEqual(names, ["capped"])
-            self.assertNotIn("nameOnly", results["started"][0].command)
+            self.assertNotIn("nameOnly", listener.started_events[0].command)
 
         # Should send nameOnly (except on 2.6).
-        filter: Any
         for filter in (None, {}, {"name": {"$in": ["capped", "non_capped"]}}):
-            results.clear()
+            listener.reset()
             names = db.list_collection_names(filter=filter)
             self.assertIn("capped", names)
             self.assertIn("non_capped", names)
-            command = results["started"][0].command
+            command = listener.started_events[0].command
             self.assertIn("nameOnly", command)
             self.assertTrue(command["nameOnly"])
+
+    def test_check_exists(self):
+        listener = OvertCommandListener()
+        client = rs_or_single_client(event_listeners=[listener])
+        self.addCleanup(client.close)
+        db = client[self.db.name]
+        db.drop_collection("unique")
+        db.create_collection("unique", check_exists=True)
+        self.assertIn("listCollections", listener.started_command_names())
+        listener.reset()
+        db.drop_collection("unique")
+        db.create_collection("unique", check_exists=False)
+        self.assertTrue(len(listener.started_events) > 0)
+        self.assertNotIn("listCollections", listener.started_command_names())
 
     def test_list_collections(self):
         self.client.drop_database("pymongo_test")
@@ -404,7 +435,7 @@ class TestDatabase(IntegrationTest):
         db.test.insert_one(SON([("hello", "world"), ("_id", 5)]))
 
         db = self.client.get_database(
-            "pymongo_test", codec_options=CodecOptions(document_class=SON)
+            "pymongo_test", codec_options=CodecOptions(document_class=SON[str, Any])
         )
         cursor = db.test.find()
         for x in cursor:
@@ -438,7 +469,7 @@ class TestDatabase(IntegrationTest):
 
         db.test.insert_one({"_id": 4, "foo": "bar"})
         db = self.client.get_database(
-            "pymongo_test", codec_options=CodecOptions(document_class=SON)
+            "pymongo_test", codec_options=CodecOptions(document_class=SON[str, Any])
         )
         self.assertEqual(
             SON([("foo", "bar")]), db.dereference(DBRef("test", 4), projection={"_id": False})

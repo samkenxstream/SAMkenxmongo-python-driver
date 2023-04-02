@@ -15,7 +15,8 @@ command_type: system
 # Protect ourself against rogue test case, or curl gone wild, that runs forever
 # Good rule of thumb: the averageish length a task takes, times 5
 # That roughly accounts for variable system performance for various buildvariants
-exec_timeout_secs: 1800 # 30 minutes is the longest we'll ever run
+exec_timeout_secs: 3600 # 60 minutes is the longest we'll ever run (primarily
+                        # for macos hosts)
 
 # What to do when evergreen hits the timeout (`post:` tasks are run automatically)
 timeout:
@@ -135,8 +136,8 @@ functions:
           # Coverage combine merges (and removes) all the coverage files and
           # generates a new .coverage file in the current directory.
           ls -la coverage/
-          /opt/python/3.6/bin/python3 -m coverage combine coverage/coverage.*
-          /opt/python/3.6/bin/python3 -m coverage html -d htmlcov
+          /opt/python/3.7/bin/python3 -m coverage combine coverage/coverage.*
+          /opt/python/3.7/bin/python3 -m coverage html -d htmlcov
     # Upload the resulting html coverage report.
     - command: shell.exec
       params:
@@ -165,7 +166,10 @@ functions:
         script: |
           set -o xtrace
           ${PREPARE_SHELL}
-          find $MONGO_ORCHESTRATION_HOME -name \*.log | xargs tar czf mongodb-logs.tar.gz
+          mkdir out_dir
+          find $MONGO_ORCHESTRATION_HOME -name \*.log -exec sh -c 'x="{}"; mv $x $PWD/out_dir/$(basename $(dirname $x))_$(basename $x)' \;
+          tar zcvf mongodb-logs.tar.gz -C out_dir/ .
+          rm -rf out_dir
     - command: archive.targz_pack
       params:
         target: "mongo-coredumps.tgz"
@@ -281,6 +285,10 @@ functions:
                 echo "Enabling coredumps"
                 ulimit -c unlimited
               fi
+          fi
+
+          if [ -n "${skip_crypt_shared}" ]; then
+            export SKIP_CRYPT_SHARED=1
           fi
 
           ${PREPARE_SHELL}
@@ -450,6 +458,10 @@ functions:
             export LIBMONGOCRYPT_URL="${libmongocrypt_url}"
             export TEST_ENCRYPTION=1
           fi
+          if [ -n "${test_crypt_shared}" ]; then
+            export TEST_CRYPT_SHARED=1
+            export CRYPT_SHARED_LIB_PATH=${CRYPT_SHARED_LIB_PATH}
+          fi
           if [ -n "${test_pyopenssl}" ]; then
             export TEST_PYOPENSSL=1
           fi
@@ -464,14 +476,15 @@ functions:
           fi
           if [ -n "${test_serverless}" ]; then
             export TEST_SERVERLESS=1
-            export MONGODB_URI="${SINGLE_ATLASPROXY_SERVERLESS_URI}"
             export SERVERLESS_ATLAS_USER="${SERVERLESS_ATLAS_USER}"
             export SERVERLESS_ATLAS_PASSWORD="${SERVERLESS_ATLAS_PASSWORD}"
-            export SINGLE_MONGOS_LB_URI="${SINGLE_ATLASPROXY_SERVERLESS_URI}"
-            export MULTI_MONGOS_LB_URI="${MULTI_ATLASPROXY_SERVERLESS_URI}"
+            export MONGODB_URI="${SERVERLESS_URI}"
+            export SINGLE_MONGOS_LB_URI="${MONGODB_URI}"
+            export MULTI_MONGOS_LB_URI="${MONGODB_URI}"
           fi
 
-          PYTHON_BINARY=${PYTHON_BINARY} \
+          MONGODB_VERSION=${VERSION} \
+            PYTHON_BINARY=${PYTHON_BINARY} \
             GREEN_FRAMEWORK=${GREEN_FRAMEWORK} \
             C_EXTENSIONS=${C_EXTENSIONS} \
             COVERAGE=${COVERAGE} \
@@ -489,8 +502,27 @@ functions:
         silent: true
         working_dir: "src"
         script: |
-          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
-          PYTHON_BINARY=${PYTHON_BINARY} SASL_HOST=${sasl_host} SASL_PORT=${sasl_port} SASL_USER=${sasl_user} SASL_PASS=${sasl_pass} SASL_DB=${sasl_db} PRINCIPAL=${principal} GSSAPI_DB=${gssapi_db} KEYTAB_BASE64=${keytab_base64} PROJECT_DIRECTORY=${PROJECT_DIRECTORY} bash ${PROJECT_DIRECTORY}/.evergreen/run-enterprise-auth-tests.sh
+          cat <<EOT > prepare_enterprise_auth.sh
+          export SASL_HOST='${sasl_host}'
+          export SASL_PORT='${sasl_port}'
+          export SASL_USER='${sasl_user}'
+          export SASL_PASS='${sasl_pass}'
+          export SASL_DB='${sasl_db}'
+          export PRINCIPAL='${principal}'
+          export GSSAPI_DB='${gssapi_db}'
+          export KEYTAB_BASE64='${keytab_base64}'
+          EOT
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          # Disable xtrace (just in case it was accidentally set).
+          set +x
+          . ./prepare_enterprise_auth.sh
+          rm -f ./prepare_enterprise_auth.sh
+
+          PYTHON_BINARY=${PYTHON_BINARY} PROJECT_DIRECTORY=${PROJECT_DIRECTORY} bash ${PROJECT_DIRECTORY}/.evergreen/run-enterprise-auth-tests.sh
 
   "run atlas tests":
     - command: shell.exec
@@ -549,7 +581,13 @@ functions:
 
               "iam_auth_ec2_instance_account" : "${iam_auth_ec2_instance_account}",
               "iam_auth_ec2_instance_secret_access_key" : "${iam_auth_ec2_instance_secret_access_key}",
-              "iam_auth_ec2_instance_profile" : "${iam_auth_ec2_instance_profile}"
+              "iam_auth_ec2_instance_profile" : "${iam_auth_ec2_instance_profile}",
+
+              "iam_auth_assume_web_role_name": "${iam_auth_assume_web_role_name}",
+              "iam_web_identity_issuer": "${iam_web_identity_issuer}",
+              "iam_web_identity_rsa_key": "${iam_web_identity_rsa_key}",
+              "iam_web_identity_jwks_uri": "${iam_web_identity_jwks_uri}",
+              "iam_web_identity_token_file": "${iam_web_identity_token_file}"
           }
           EOF
 
@@ -639,6 +677,73 @@ functions:
         working_dir: "src"
         script: |
           ${PREPARE_SHELL}
+          if [ "${skip_EC2_auth_test}" = "true" ]; then
+             echo "This platform does not support the EC2 auth test, skipping..."
+             exit 0
+          fi
+          # Write an empty prepare_mongodb_aws so no auth environment variables
+          # are set.
+          rm "${PROJECT_DIRECTORY}/prepare_mongodb_aws.sh" || true
+          PYTHON_BINARY=${PYTHON_BINARY} ASSERT_NO_URI_CREDS=true .evergreen/run-mongodb-aws-test.sh
+
+  "run aws auth test with aws web identity credentials":
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+          if [ "${skip_EC2_auth_test}" = "true" ]; then
+             echo "This platform does not support the web identity auth test, skipping..."
+             exit 0
+          fi
+          cd ${DRIVERS_TOOLS}/.evergreen/auth_aws
+          . ./activate_venv.sh
+          mongo aws_e2e_web_identity.js
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        silent: true
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          cat <<'EOF' > "${PROJECT_DIRECTORY}/prepare_mongodb_aws.sh"
+            export AWS_ROLE_ARN="${iam_auth_assume_web_role_name}"
+            export AWS_WEB_IDENTITY_TOKEN_FILE="${iam_web_identity_token_file}"
+          EOF
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+          if [ "${skip_web_identity_auth_test}" = "true" ]; then
+             echo "This platform does not support the web identity auth test, skipping..."
+             exit 0
+          fi
+          PYTHON_BINARY=${PYTHON_BINARY} ASSERT_NO_URI_CREDS=true .evergreen/run-mongodb-aws-test.sh
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        silent: true
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          cat <<'EOF' > "${PROJECT_DIRECTORY}/prepare_mongodb_aws.sh"
+            export AWS_ROLE_ARN="${iam_auth_assume_web_role_name}"
+            export AWS_WEB_IDENTITY_TOKEN_FILE="${iam_web_identity_token_file}"
+            export AWS_ROLE_SESSION_NAME="test"
+          EOF
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: "src"
+        script: |
+          ${PREPARE_SHELL}
+          if [ "${skip_web_identity_auth_test}" = "true" ]; then
+             echo "This platform does not support the web identity auth test, skipping..."
+             exit 0
+          fi
           PYTHON_BINARY=${PYTHON_BINARY} ASSERT_NO_URI_CREDS=true .evergreen/run-mongodb-aws-test.sh
 
   "run aws auth test with aws credentials as environment variables":
@@ -880,7 +985,7 @@ functions:
         script: |
           set -o xtrace
           ${PREPARE_SHELL}
-          .evergreen/release.sh
+          VERSION=${VERSION} ENSURE_UNIVERSAL2=${ENSURE_UNIVERSAL2} .evergreen/release.sh
 
   "upload release":
     - command: archive.targz_pack
@@ -932,7 +1037,7 @@ functions:
           done
           # Build source distribution.
           cd src/
-          /opt/python/3.6/bin/python3 setup.py sdist
+          /opt/python/3.7/bin/python3 setup.py sdist
           cp dist/* ../releases
     - command: archive.targz_pack
       params:
@@ -1005,6 +1110,87 @@ task_groups:
     tasks:
       - ".serverless"
 
+  - name: testgcpkms_task_group
+    setup_group_can_fail_task: true
+    setup_group_timeout_secs: 1800 # 30 minutes
+    setup_group:
+      - func: fetch source
+      - func: prepare resources
+      - func: fix absolute paths
+      - func: make files executable
+      - command: shell.exec
+        params:
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+            echo '${testgcpkms_key_file}' > /tmp/testgcpkms_key_file.json
+            export GCPKMS_KEYFILE=/tmp/testgcpkms_key_file.json
+            export GCPKMS_DRIVERS_TOOLS=$DRIVERS_TOOLS
+            export GCPKMS_SERVICEACCOUNT="${testgcpkms_service_account}"
+            export GCPKMS_MACHINETYPE="e2-standard-4"
+            $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/create-and-setup-instance.sh
+      # Load the GCPKMS_GCLOUD, GCPKMS_INSTANCE, GCPKMS_REGION, and GCPKMS_ZONE expansions.
+      - command: expansions.update
+        params:
+          file: testgcpkms-expansions.yml
+    teardown_group:
+      - command: shell.exec
+        params:
+          shell: "bash"
+          script: |
+            ${PREPARE_SHELL}
+            export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+            export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+            export GCPKMS_ZONE=${GCPKMS_ZONE}
+            export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+            $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/delete-instance.sh
+    tasks:
+      - testgcpkms-task
+
+  - name: testazurekms_task_group
+    setup_group:
+    - func: fetch source
+    - func: prepare resources
+    - func: fix absolute paths
+    - func: make files executable
+    - command: shell.exec
+      params:
+        silent: true
+        shell: bash
+        script: |-
+          set -o errexit
+          ${PREPARE_SHELL}
+          echo '${testazurekms_publickey}' > /tmp/testazurekms_publickey
+          echo '${testazurekms_privatekey}' > /tmp/testazurekms_privatekey
+          # Set 600 permissions on private key file. Otherwise ssh / scp may error with permissions "are too open".
+          chmod 600 /tmp/testazurekms_privatekey
+          export AZUREKMS_CLIENTID="${testazurekms_clientid}"
+          export AZUREKMS_TENANTID="${testazurekms_tenantid}"
+          export AZUREKMS_SECRET="${testazurekms_secret}"
+          export AZUREKMS_DRIVERS_TOOLS="$DRIVERS_TOOLS"
+          export AZUREKMS_RESOURCEGROUP="${testazurekms_resourcegroup}"
+          export AZUREKMS_PUBLICKEYPATH="/tmp/testazurekms_publickey"
+          export AZUREKMS_PRIVATEKEYPATH="/tmp/testazurekms_privatekey"
+          export AZUREKMS_SCOPE="${testazurekms_scope}"
+          export AZUREKMS_VMNAME_PREFIX="PYTHON_DRIVER"
+          $DRIVERS_TOOLS/.evergreen/csfle/azurekms/create-and-setup-vm.sh
+    - command: expansions.update
+      params:
+        file: testazurekms-expansions.yml
+    teardown_group:
+    - command: shell.exec
+      params:
+        shell: bash
+        script: |-
+          ${PREPARE_SHELL}
+          export AZUREKMS_VMNAME=${AZUREKMS_VMNAME}
+          export AZUREKMS_RESOURCEGROUP=${testazurekms_resourcegroup}
+          $DRIVERS_TOOLS/.evergreen/csfle/azurekms/delete-vm.sh
+    setup_group_can_fail_task: true
+    setup_group_timeout_secs: 1800
+    tasks:
+    - testazurekms-task
+
 tasks:
     # Wildcard task. Do you need to find out what tools are available and where?
     # Throw it here, and execute this task on all buildvariants
@@ -1035,11 +1221,34 @@ tasks:
                genhtml --version || true
                valgrind --version || true
 
-    - name: "release-mac"
+    - name: "release-mac-1100"
+      tags: ["release_tag"]
+      run_on: macos-1100
+      commands:
+        - func: "build release"
+          vars:
+              VERSION: "3.11"
+              ENSURE_UNIVERSAL2: "1"
+        - func: "build release"
+          vars:
+              VERSION: "3.10"
+              ENSURE_UNIVERSAL2: "1"
+        - func: "build release"
+          vars:
+              VERSION: "3.9"
+              ENSURE_UNIVERSAL2: "1"
+        - func: "upload release"
+
+    - name: "release-mac-1014"
       tags: ["release_tag"]
       run_on: macos-1014
       commands:
         - func: "build release"
+          vars:
+              VERSION: "3.7"
+        - func: "build release"
+          vars:
+              VERSION: "3.8"
         - func: "upload release"
 
     - name: "release-windows"
@@ -1232,6 +1441,32 @@ tasks:
             VERSION: "5.0"
             TOPOLOGY: "sharded_cluster"
         - func: "run tests"
+    - name: "test-6.0-standalone"
+      tags: ["6.0", "standalone"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "6.0"
+            TOPOLOGY: "server"
+        - func: "run tests"
+
+    - name: "test-6.0-replica_set"
+      tags: ["6.0", "replica_set"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "6.0"
+            TOPOLOGY: "replica_set"
+        - func: "run tests"
+
+    - name: "test-6.0-sharded_cluster"
+      tags: ["6.0", "sharded_cluster"]
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "6.0"
+            TOPOLOGY: "sharded_cluster"
+        - func: "run tests"
 
     - name: "test-latest-standalone"
       tags: ["latest", "standalone"]
@@ -1324,7 +1559,7 @@ tasks:
       commands:
         - func: "run tests"
           vars:
-            PYTHON_BINARY: /opt/python/3.6/bin/python3
+            PYTHON_BINARY: /opt/python/3.7/bin/python3
 
     - name: "atlas-connect"
       tags: ["atlas-connect"]
@@ -1676,6 +1911,7 @@ tasks:
         - func: "run aws auth test with aws credentials as environment variables"
         - func: "run aws auth test with aws credentials and session token as environment variables"
         - func: "run aws auth test with aws EC2 credentials"
+        - func: "run aws auth test with aws web identity credentials"
         - func: "run aws ECS auth test"
 
     - name: "aws-auth-test-5.0"
@@ -1692,6 +1928,24 @@ tasks:
         - func: "run aws auth test with aws credentials as environment variables"
         - func: "run aws auth test with aws credentials and session token as environment variables"
         - func: "run aws auth test with aws EC2 credentials"
+        - func: "run aws auth test with aws web identity credentials"
+        - func: "run aws ECS auth test"
+
+    - name: "aws-auth-test-6.0"
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            AUTH: "auth"
+            ORCHESTRATION_FILE: "auth-aws.json"
+            TOPOLOGY: "server"
+            VERSION: "6.0"
+        - func: "add aws auth variables to file"
+        - func: "run aws auth test with regular aws credentials"
+        - func: "run aws auth test with assume role credentials"
+        - func: "run aws auth test with aws credentials as environment variables"
+        - func: "run aws auth test with aws credentials and session token as environment variables"
+        - func: "run aws auth test with aws EC2 credentials"
+        - func: "run aws auth test with aws web identity credentials"
         - func: "run aws ECS auth test"
 
     - name: "aws-auth-test-latest"
@@ -1708,6 +1962,23 @@ tasks:
         - func: "run aws auth test with aws credentials as environment variables"
         - func: "run aws auth test with aws credentials and session token as environment variables"
         - func: "run aws auth test with aws EC2 credentials"
+        - func: "run aws auth test with aws web identity credentials"
+        - func: "run aws ECS auth test"
+    - name: "aws-auth-test-rapid"
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            AUTH: "auth"
+            ORCHESTRATION_FILE: "auth-aws.json"
+            TOPOLOGY: "server"
+            VERSION: "rapid"
+        - func: "add aws auth variables to file"
+        - func: "run aws auth test with regular aws credentials"
+        - func: "run aws auth test with assume role credentials"
+        - func: "run aws auth test with aws credentials as environment variables"
+        - func: "run aws auth test with aws credentials and session token as environment variables"
+        - func: "run aws auth test with aws EC2 credentials"
+        - func: "run aws auth test with aws web identity credentials"
         - func: "run aws ECS auth test"
 
     - name: load-balancer-test
@@ -1751,6 +2022,114 @@ tasks:
       commands:
         - func: "download and merge coverage"
 
+    - name: "testgcpkms-task"
+      commands:
+        - command: shell.exec
+          type: setup
+          params:
+            working_dir: "src"
+            shell: "bash"
+            script: |
+              ${PREPARE_SHELL}
+              echo "Copying files ... begin"
+              export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+              export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+              export GCPKMS_ZONE=${GCPKMS_ZONE}
+              export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+              tar czf /tmp/mongo-python-driver.tgz .
+              GCPKMS_SRC=/tmp/mongo-python-driver.tgz GCPKMS_DST=$GCPKMS_INSTANCENAME: $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/copy-file.sh
+              echo "Copying files ... end"
+              echo "Untarring file ... begin"
+              GCPKMS_CMD="tar xf mongo-python-driver.tgz" $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/run-command.sh
+              echo "Untarring file ... end"
+        - command: shell.exec
+          type: test
+          params:
+            working_dir: "src"
+            shell: "bash"
+            script: |
+              ${PREPARE_SHELL}
+              export GCPKMS_GCLOUD=${GCPKMS_GCLOUD}
+              export GCPKMS_PROJECT=${GCPKMS_PROJECT}
+              export GCPKMS_ZONE=${GCPKMS_ZONE}
+              export GCPKMS_INSTANCENAME=${GCPKMS_INSTANCENAME}
+              GCPKMS_CMD="SUCCESS=true TEST_FLE_GCP_AUTO=1 LIBMONGOCRYPT_URL=https://s3.amazonaws.com/mciuploads/libmongocrypt/debian10/master/latest/libmongocrypt.tar.gz ./.evergreen/run-tests.sh" $DRIVERS_TOOLS/.evergreen/csfle/gcpkms/run-command.sh
+
+    - name: "testgcpkms-fail-task"
+      # testgcpkms-fail-task runs in a non-GCE environment.
+      # It is expected to fail to obtain GCE credentials.
+      commands:
+        - func: "bootstrap mongo-orchestration"
+          vars:
+            VERSION: "latest"
+            TOPOLOGY: "server"
+        - command: shell.exec
+          type: test
+          params:
+            working_dir: "src"
+            shell: "bash"
+            script: |
+              ${PREPARE_SHELL}
+              export LIBMONGOCRYPT_URL=https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1804-64/master/latest/libmongocrypt.tar.gz
+              SUCCESS=false TEST_FLE_GCP_AUTO=1 ./.evergreen/run-tests.sh
+
+    - name: testazurekms-task
+      commands:
+      - command: shell.exec
+        params:
+          shell: bash
+          script: |-
+            set -o errexit
+            ${PREPARE_SHELL}
+            cd src
+            echo "Copying files ... begin"
+            export AZUREKMS_RESOURCEGROUP=${testazurekms_resourcegroup}
+            export AZUREKMS_VMNAME=${AZUREKMS_VMNAME}
+            export AZUREKMS_PRIVATEKEYPATH=/tmp/testazurekms_privatekey
+            tar czf /tmp/mongo-python-driver.tgz .
+            AZUREKMS_SRC="/tmp/mongo-python-driver.tgz" \
+            AZUREKMS_DST="~/" \
+              $DRIVERS_TOOLS/.evergreen/csfle/azurekms/copy-file.sh
+            echo "Copying files ... end"
+            echo "Untarring file ... begin"
+            AZUREKMS_CMD="tar xf mongo-python-driver.tgz" \
+              $DRIVERS_TOOLS/.evergreen/csfle/azurekms/run-command.sh
+            echo "Untarring file ... end"
+      - command: shell.exec
+        type: test
+        params:
+          shell: bash
+          script: |-
+            set -o errexit
+            ${PREPARE_SHELL}
+            export AZUREKMS_RESOURCEGROUP=${testazurekms_resourcegroup}
+            export AZUREKMS_VMNAME=${AZUREKMS_VMNAME}
+            export AZUREKMS_PRIVATEKEYPATH=/tmp/testazurekms_privatekey
+            AZUREKMS_CMD="KEY_NAME='${testazurekms_keyname}' KEY_VAULT_ENDPOINT='${testazurekms_keyvaultendpoint}'  LIBMONGOCRYPT_URL=https://s3.amazonaws.com/mciuploads/libmongocrypt/debian10/master/latest/libmongocrypt.tar.gz SUCCESS=true TEST_FLE_AZURE_AUTO=1 ./.evergreen/run-tests.sh" \
+              $DRIVERS_TOOLS/.evergreen/csfle/azurekms/run-command.sh
+
+    - name: testazurekms-fail-task
+      commands:
+      - func: fetch source
+      - func: make files executable
+      - func: "bootstrap mongo-orchestration"
+        vars:
+          VERSION: "latest"
+          TOPOLOGY: "server"
+      - command: shell.exec
+        type: test
+        params:
+          shell: bash
+          script: |-
+            set -o errexit
+            ${PREPARE_SHELL}
+            cd src
+            PYTHON_BINARY=
+            KEY_NAME='${testazurekms_keyname}' \
+            KEY_VAULT_ENDPOINT='${testazurekms_keyvaultendpoint}' \
+            LIBMONGOCRYPT_URL=https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1804-64/master/latest/libmongocrypt.tar.gz \
+            SUCCESS=false TEST_FLE_AZURE_AUTO=1 \
+            ./.evergreen/run-tests.sh
 
 axes:
   # Choice of distro
@@ -1762,6 +2141,7 @@ axes:
         run_on: amazon1-2018-test
         batchtime: 10080  # 7 days
         variables:
+          skip_crypt_shared: true
           python3_binary: "/opt/python/3.8/bin/python3"
           libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/linux-64-amazon-ami/master/latest/libmongocrypt.tar.gz
       - id: archlinux-test
@@ -1781,6 +2161,16 @@ axes:
         variables:
           skip_EC2_auth_test: true
           skip_ECS_auth_test: true
+          skip_web_identity_auth_test: true
+          python3_binary: /Library/Frameworks/Python.framework/Versions/3.8/bin/python3
+          libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/macos/master/latest/libmongocrypt.tar.gz
+      - id: macos-1100
+        display_name: "macOS 11.00"
+        run_on: macos-1100
+        variables:
+          skip_EC2_auth_test: true
+          skip_ECS_auth_test: true
+          skip_web_identity_auth_test: true
           python3_binary: /Library/Frameworks/Python.framework/Versions/3.8/bin/python3
           libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/macos/master/latest/libmongocrypt.tar.gz
       - id: rhel62
@@ -1824,17 +2214,17 @@ axes:
         batchtime: 10080  # 7 days
         variables:
           python3_binary: python3
-      - id: ubuntu1804-zseries
-        display_name: "Ubuntu 18.04 (zSeries)"
-        run_on: ubuntu1804-zseries-small
+      - id: rhel83-zseries
+        display_name: "RHEL 8.3 (zSeries)"
+        run_on: rhel83-zseries-small
         batchtime: 10080  # 7 days
-      - id: ubuntu1804-power8
-        display_name: "Ubuntu 18.04 (POWER8)"
-        run_on: ubuntu1804-power8-small
+      - id: rhel81-power8
+        display_name: "RHEL 8.1 (POWER8)"
+        run_on: rhel81-power8-small
         batchtime: 10080  # 7 days
-      - id: ubuntu1804-arm64
-        display_name: "Ubuntu 18.04 (ARM64)"
-        run_on: ubuntu1804-arm64-small
+      - id: rhel82-arm64
+        display_name: "RHEL 8.2 (ARM64)"
+        run_on: rhel82-arm64-small
         batchtime: 10080  # 7 days
         variables:
           libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/ubuntu1804-arm64/master/latest/libmongocrypt.tar.gz
@@ -1844,6 +2234,8 @@ axes:
         batchtime: 10080  # 7 days
         variables:
           skip_ECS_auth_test: true
+          skip_EC2_auth_test: true
+          skip_web_identity_auth_test: true
           python3_binary: "C:/python/Python38/python.exe"
           venv_bin_dir: "Scripts"
           libmongocrypt_url: https://s3.amazonaws.com/mciuploads/libmongocrypt/windows-test/master/latest/libmongocrypt.tar.gz
@@ -1930,6 +2322,10 @@ axes:
         display_name: "MongoDB 5.0"
         variables:
           VERSION: "5.0"
+      - id: "6.0"
+        display_name: "MongoDB 6.0"
+        variables:
+          VERSION: "6.0"
       - id: "latest"
         display_name: "MongoDB latest"
         variables:
@@ -1945,10 +2341,6 @@ axes:
     values:
       # Note: always display platform with python-version to avoid ambiguous display names.
       # Linux
-      - id: "3.6"
-        display_name: "Python 3.6"
-        variables:
-           PYTHON_BINARY: "/opt/python/3.6/bin/python3"
       - id: "3.7"
         display_name: "Python 3.7"
         variables:
@@ -1965,10 +2357,10 @@ axes:
         display_name: "Python 3.10"
         variables:
           PYTHON_BINARY: "/opt/python/3.10/bin/python3"
-      - id: "pypy3.6"
-        display_name: "PyPy 3.6"
+      - id: "3.11"
+        display_name: "Python 3.11"
         variables:
-           PYTHON_BINARY: "/opt/python/pypy3.6/bin/pypy3"
+          PYTHON_BINARY: "/opt/python/3.11/bin/python3"
       - id: "pypy3.7"
         display_name: "PyPy 3.7"
         variables:
@@ -1977,6 +2369,10 @@ axes:
         display_name: "PyPy 3.8"
         variables:
            PYTHON_BINARY: "/opt/python/pypy3.8/bin/pypy3"
+
+  - id: python-version-mac
+    display_name: "Python"
+    values:
       - id: "system-python3"
         display_name: "Python3"
         variables:
@@ -1985,10 +2381,6 @@ axes:
   - id: python-version-windows
     display_name: "Python"
     values:
-      - id: "3.6"
-        display_name: "Python 3.6"
-        variables:
-          PYTHON_BINARY: "C:/python/Python36/python.exe"
       - id: "3.7"
         display_name: "Python 3.7"
         variables:
@@ -2005,14 +2397,14 @@ axes:
         display_name: "Python 3.10"
         variables:
           PYTHON_BINARY: "C:/python/Python310/python.exe"
+      - id: "3.11"
+        display_name: "Python 3.11"
+        variables:
+          PYTHON_BINARY: "C:/python/Python311/python.exe"
 
   - id: python-version-windows-32
     display_name: "Python"
     values:
-      - id: "3.6"
-        display_name: "32-bit Python 3.6"
-        variables:
-          PYTHON_BINARY: "C:/python/32/Python36/python.exe"
       - id: "3.7"
         display_name: "32-bit Python 3.7"
         variables:
@@ -2029,6 +2421,10 @@ axes:
         display_name: "32-bit Python 3.10"
         variables:
           PYTHON_BINARY: "C:/python/32/Python310/python.exe"
+      - id: "3.11"
+        display_name: "32-bit Python 3.11"
+        variables:
+          PYTHON_BINARY: "C:/python/32/Python311/python.exe"
 
   # Choice of mod_wsgi version
   - id: mod-wsgi-version
@@ -2111,6 +2507,14 @@ axes:
         variables:
           test_encryption: true
         batchtime: 10080  # 7 days
+      # The path to crypt_shared is stored in the $CRYPT_SHARED_LIB_PATH expansion.
+      - id: "encryption_crypt_shared"
+        display_name: "Encryption shared lib"
+        tags: ["encryption_tag"]
+        variables:
+          test_encryption: true
+          test_crypt_shared: true
+        batchtime: 10080  # 7 days
 
   # Run pyopenssl tests?
   - id: pyopenssl
@@ -2167,33 +2571,17 @@ buildvariants:
 - matrix_name: "tests-all"
   matrix_spec:
     platform:
-      # OSes that support versions of MongoDB>=2.6 with SSL.
-      - awslinux
+      # OSes that support versions of MongoDB>=3.6 with SSL.
+      - ubuntu-18.04
     auth-ssl: "*"
   display_name: "${platform} ${auth-ssl}"
-  tasks: &all-server-versions
-    - ".rapid"
-    - ".latest"
+  tasks:
+    - ".6.0"
     - ".5.0"
     - ".4.4"
     - ".4.2"
     - ".4.0"
     - ".3.6"
-
-- matrix_name: "tests-all-encryption"
-  matrix_spec:
-    platform:
-      # OSes that support versions of MongoDB>=2.6 with SSL.
-      - awslinux
-    auth-ssl: "*"
-    encryption: "*"
-  display_name: "Encryption ${platform} ${auth-ssl}"
-  tasks: &encryption-server-versions
-    - ".latest"
-    - ".5.0"
-    - ".4.4"
-    - ".4.2"
-    - ".4.0"
 
 - matrix_name: "tests-archlinux"
   matrix_spec:
@@ -2234,6 +2622,7 @@ buildvariants:
   display_name: "${platform} ${auth} ${ssl}"
   tasks:
     - ".latest"
+    - ".6.0"
     - ".5.0"
     - ".4.4"
     - ".4.2"
@@ -2243,24 +2632,31 @@ buildvariants:
 - matrix_name: "test-macos-encryption"
   matrix_spec:
     platform:
-      - macos-1014
+      - macos-1100
     auth: "auth"
     ssl: "nossl"
     encryption: "*"
-  display_name: "Encryption ${platform} ${auth} ${ssl}"
-  tasks: *encryption-server-versions
+  display_name: "${encryption} ${platform} ${auth} ${ssl}"
+  tasks: &encryption-server-versions
+    - ".rapid"
+    - ".latest"
+    - ".6.0"
+    - ".5.0"
+    - ".4.4"
+    - ".4.2"
+    - ".4.0"
 
-# Test one server version (4.2) with zSeries, POWER8, and ARM.
+# Test one server version with zSeries, POWER8, and ARM.
 - matrix_name: "test-different-cpu-architectures"
   matrix_spec:
     platform:
-      - ubuntu1804-zseries # Ubuntu 18 or RHEL 8.x?
-      - ubuntu1804-power8 # Ubuntu 18 or RHEL 7?
-      - ubuntu1804-arm64
+      - rhel83-zseries  # Added in 5.0.8 (SERVER-44074)
+      - rhel81-power8 # Added in 4.2.7 (SERVER-44072)
+      - rhel82-arm64 # Added in 4.4.2 (SERVER-48282)
     auth-ssl: "*"
   display_name: "${platform} ${auth-ssl}"
   tasks:
-    - ".4.2"
+    - ".6.0"
 
 - matrix_name: "tests-python-version-ubuntu18-test-ssl"
   matrix_spec:
@@ -2269,7 +2665,15 @@ buildvariants:
     auth-ssl: "*"
     coverage: "*"
   display_name: "${python-version} ${platform} ${auth-ssl} ${coverage}"
-  tasks: *all-server-versions
+  tasks: &all-server-versions
+    - ".rapid"
+    - ".latest"
+    - ".6.0"
+    - ".5.0"
+    - ".4.4"
+    - ".4.2"
+    - ".4.0"
+    - ".3.6"
 
 - matrix_name: "tests-pyopenssl"
   matrix_spec:
@@ -2281,7 +2685,7 @@ buildvariants:
   # Only test "noauth" with Python 3.7.
   exclude_spec:
     platform: ubuntu-18.04
-    python-version: ["3.6", "3.8", "3.9", "3.10", "pypy3.6", "pypy3.7", "pypy3.8"]
+    python-version: ["3.8", "3.9", "3.10", "pypy3.7", "pypy3.8"]
     auth: "noauth"
     ssl: "ssl"
     pyopenssl: "*"
@@ -2321,8 +2725,9 @@ buildvariants:
 # dependency tests-python-version-rhel62-test-encryption_.../test-2.6-standalone is not present in the project config
 #    coverage: "*"
     encryption: "*"
-  display_name: "Encryption ${python-version} ${platform} ${auth-ssl}"
+  display_name: "${encryption} ${python-version} ${platform} ${auth-ssl}"
   tasks: *encryption-server-versions
+
 
 - matrix_name: "tests-python-version-ubuntu18-without-c-extensions"
   matrix_spec:
@@ -2334,7 +2739,7 @@ buildvariants:
   exclude_spec:
    # These interpreters are always tested without extensions.
    - platform: ubuntu-18.04
-     python-version: ["pypy3.6", "pypy3.7", "pypy3.8"]
+     python-version: ["pypy3.7", "pypy3.8"]
      c-extensions: "*"
      auth-ssl: "*"
      coverage: "*"
@@ -2350,7 +2755,7 @@ buildvariants:
   exclude_spec:
    # These interpreters are always tested without extensions.
    - platform: ubuntu-18.04
-     python-version: ["pypy3.6", "pypy3.7", "pypy3.8"]
+     python-version: ["pypy3.7", "pypy3.8"]
      c-extensions: "with-c-extensions"
      compression: "*"
   display_name: "${compression} ${c-extensions} ${python-version} ${platform}"
@@ -2379,11 +2784,25 @@ buildvariants:
   exclude_spec:
    # Don't test green frameworks on these Python versions.
    - platform: ubuntu-18.04
-     python-version: ["pypy3.6", "pypy3.7", "pypy3.8", "system-python3"]
+     python-version: ["pypy3.7", "pypy3.8", "3.11"]
      green-framework: "*"
      auth-ssl: "*"
   display_name: "${green-framework} ${python-version} ${platform} ${auth-ssl}"
   tasks: *all-server-versions
+
+- matrix_name: "tests-python-version-green-framework-ubuntu20"
+  matrix_spec:
+    platform: ubuntu-20.04
+    python-version: ["3.11"]
+    green-framework: "*"
+    auth-ssl: "*"
+  display_name: "${green-framework} ${python-version} ${platform} ${auth-ssl}"
+  tasks:
+    - ".rapid"
+    - ".latest"
+    - ".6.0"
+    - ".5.0"
+    - ".4.4"
 
 - matrix_name: "tests-windows-python-version"
   matrix_spec:
@@ -2405,11 +2824,11 @@ buildvariants:
   matrix_spec:
     platform: awslinux
     # Python 3.10+ requires OpenSSL 1.1.1+
-    python-version: ["3.6", "3.7", "3.8", "3.9", "pypy3.6", "pypy3.7", "pypy3.8"]
+    python-version: ["3.7", "3.8", "3.9", "pypy3.7", "pypy3.8"]
     auth-ssl: "*"
   display_name: "OpenSSL 1.0.2 ${python-version} ${platform} ${auth-ssl}"
   tasks:
-     - ".latest"
+     - ".5.0"
 
 - matrix_name: "tests-windows-encryption"
   matrix_spec:
@@ -2417,15 +2836,15 @@ buildvariants:
     python-version-windows: "*"
     auth-ssl: "*"
     encryption: "*"
-  display_name: "Encryption ${platform} ${python-version-windows} ${auth-ssl}"
+  display_name: "${encryption} ${platform} ${python-version-windows} ${auth-ssl}"
   tasks: *encryption-server-versions
 
-# Storage engine tests on Ubuntu 18.04 (x86_64) with Python 3.6.
+# Storage engine tests on Ubuntu 18.04 (x86_64) with Python 3.7.
 - matrix_name: "tests-storage-engines"
   matrix_spec:
     platform: ubuntu-18.04
     storage-engine: "*"
-    python-version: 3.6
+    python-version: 3.7
   display_name: "Storage ${storage-engine} ${python-version} ${platform}"
   rules:
     - if:
@@ -2452,12 +2871,12 @@ buildvariants:
           - "test-3.6-standalone"
           - "test-3.6-replica_set"
 
-# enableTestCommands=0 tests on Ubuntu18 (x86_64) with Python 3.6.
+# enableTestCommands=0 tests on Ubuntu18 (x86_64) with Python 3.7.
 - matrix_name: "test-disableTestCommands"
   matrix_spec:
     platform: ubuntu-18.04
     disableTestCommands: "*"
-    python-version: "3.6"
+    python-version: "3.7"
   display_name: "Disable test commands ${python-version} ${platform}"
   tasks:
      - ".latest"
@@ -2483,7 +2902,7 @@ buildvariants:
 - matrix_name: "tests-mod-wsgi"
   matrix_spec:
     platform: ubuntu-18.04
-    python-version: ["3.6", "3.7", "3.8", "3.9", "3.10"]
+    python-version: ["3.7", "3.8", "3.9", "3.10"]
     mod-wsgi-version: "*"
   exclude_spec:
    # mod-wsgi 3.5 won't build against CPython 3.8+
@@ -2498,7 +2917,7 @@ buildvariants:
 - matrix_name: "mockupdb-tests"
   matrix_spec:
     platform: ubuntu-18.04
-    python-version: 3.6
+    python-version: 3.7
   display_name: "MockupDB Tests"
   tasks:
      - name: "mockupdb"
@@ -2506,7 +2925,7 @@ buildvariants:
 - matrix_name: "tests-doctests"
   matrix_spec:
     platform: ubuntu-18.04
-    python-version: ["3.6"]
+    python-version: ["3.8"]
   display_name: "Doctests ${python-version} ${platform}"
   tasks:
      - name: "doctests"
@@ -2543,11 +2962,6 @@ buildvariants:
     python-version: "*"
     auth-ssl: auth-ssl
     serverless: "*"
-  exclude_spec:
-   - platform: ubuntu-18.04
-     python-version: ["system-python3"]
-     auth-ssl: auth-ssl
-     serverless: "*"
   display_name: "Serverless ${python-version} ${platform}"
   tasks:
     - "serverless_task_group"
@@ -2555,7 +2969,7 @@ buildvariants:
 - matrix_name: "data-lake-spec-tests"
   matrix_spec:
     platform: ubuntu-18.04
-    python-version: ["3.6", "3.10"]
+    python-version: ["3.7", "3.10"]
     auth: "auth"
     c-extensions: "*"
   display_name: "Atlas Data Lake ${python-version} ${c-extensions}"
@@ -2565,7 +2979,7 @@ buildvariants:
 - matrix_name: "stable-api-tests"
   matrix_spec:
     platform: ubuntu-18.04
-    python-version: ["3.6", "3.10"]
+    python-version: ["3.7", "3.10"]
     auth: "auth"
     versionedApi: "*"
   display_name: "Versioned API ${versionedApi} ${python-version}"
@@ -2580,8 +2994,8 @@ buildvariants:
     # OCSP stapling is not supported on Ubuntu 18.04.
     # See https://jira.mongodb.org/browse/SERVER-51364.
     platform: ubuntu-20.04
-    python-version: ["3.6", "3.10", "pypy3.6", "pypy3.8"]
-    mongodb-version: ["4.4", "5.0", "latest"]
+    python-version: ["3.7", "3.10", "pypy3.7", "pypy3.8"]
+    mongodb-version: ["4.4", "5.0", "6.0", "latest"]
     auth: "noauth"
     ssl: "ssl"
   display_name: "OCSP test ${platform} ${python-version} ${mongodb-version}"
@@ -2592,8 +3006,8 @@ buildvariants:
 - matrix_name: "ocsp-test-windows"
   matrix_spec:
     platform: windows-64-vsMulti-small
-    python-version-windows: ["3.6", "3.10"]
-    mongodb-version: ["4.4", "5.0", "latest"]
+    python-version-windows: ["3.7", "3.10"]
+    mongodb-version: ["4.4", "5.0", "6.0", "latest"]
     auth: "noauth"
     ssl: "ssl"
   display_name: "OCSP test ${platform} ${python-version-windows} ${mongodb-version}"
@@ -2605,7 +3019,7 @@ buildvariants:
 - matrix_name: "ocsp-test-macos"
   matrix_spec:
     platform: macos-1014
-    mongodb-version: ["4.4", "5.0", "latest"]
+    mongodb-version: ["4.4", "5.0", "6.0", "latest"]
     auth: "noauth"
     ssl: "ssl"
   display_name: "OCSP test ${platform} ${mongodb-version}"
@@ -2616,14 +3030,27 @@ buildvariants:
 
 - matrix_name: "aws-auth-test"
   matrix_spec:
-    platform: [ubuntu-18.04, macos-1014]
-    python-version: ["system-python3"]
+    platform: [ubuntu-18.04]
+    python-version: ["3.7"]
   display_name: "MONGODB-AWS Auth ${platform} ${python-version}"
   tasks:
     - name: "aws-auth-test-4.4"
     - name: "aws-auth-test-5.0"
     - name: "aws-auth-test-latest"
+    - name: "aws-auth-test-6.0"
+    - name: "aws-auth-test-rapid"
 
+- matrix_name: "aws-auth-test-mac"
+  matrix_spec:
+    platform: [macos-1014]
+    python-version-mac: ["system-python3"]
+  display_name: "MONGODB-AWS Auth ${platform} ${python-version-mac}"
+  tasks:
+    - name: "aws-auth-test-4.4"
+    - name: "aws-auth-test-5.0"
+    - name: "aws-auth-test-latest"
+    - name: "aws-auth-test-6.0"
+    - name: "aws-auth-test-rapid"
 - matrix_name: "aws-auth-test-windows"
   matrix_spec:
     platform: [windows-64-vsMulti-small]
@@ -2633,17 +3060,36 @@ buildvariants:
     - name: "aws-auth-test-4.4"
     - name: "aws-auth-test-5.0"
     - name: "aws-auth-test-latest"
+    - name: "aws-auth-test-6.0"
+    - name: "aws-auth-test-rapid"
 
 - matrix_name: "load-balancer"
   matrix_spec:
     platform: ubuntu-18.04
-    mongodb-version: ["rapid", "latest"]
+    mongodb-version: ["rapid", "latest", "6.0"]
     auth-ssl: "*"
     python-version: "*"
     loadbalancer: "*"
   display_name: "Load Balancer ${platform} ${python-version} ${mongodb-version} ${auth-ssl}"
   tasks:
     - name: "load-balancer-test"
+
+- name: testgcpkms-variant
+  display_name: "GCP KMS"
+  run_on:
+    - ubuntu1804-test
+  tasks:
+    - name: testgcpkms_task_group
+      batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
+    - testgcpkms-fail-task
+
+- name: testazurekms-variant
+  display_name: "Azure KMS"
+  run_on: ubuntu1804-test
+  tasks:
+    - name: testazurekms_task_group
+      batchtime: 20160 # Use a batchtime of 14 days as suggested by the CSFLE test README
+    - testazurekms-fail-task
 
 - name: Release
   display_name: Release

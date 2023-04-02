@@ -19,9 +19,9 @@
 import contextlib
 import re
 import sys
-from codecs import utf_8_decode  # type: ignore
+from codecs import utf_8_decode
 from collections import defaultdict
-from typing import no_type_check
+from typing import Iterable, no_type_check
 
 from pymongo.database import Database
 
@@ -124,7 +124,26 @@ class TestCollectionNoConnect(unittest.TestCase):
         self.assertEqual(coll2.write_concern, coll4.write_concern)
 
     def test_iteration(self):
-        self.assertRaises(TypeError, next, self.db)
+        coll = self.db.coll
+        if "PyPy" in sys.version and sys.version_info < (3, 8, 15):
+            msg = "'NoneType' object is not callable"
+        else:
+            msg = "'Collection' object is not iterable"
+        # Iteration fails
+        with self.assertRaisesRegex(TypeError, msg):
+            for _ in coll:  # type: ignore[misc] # error: "None" not callable  [misc]
+                break
+        # Non-string indices will start failing in PyMongo 5.
+        self.assertEqual(coll[0].name, "coll.0")
+        self.assertEqual(coll[{}].name, "coll.{}")
+        # next fails
+        with self.assertRaisesRegex(TypeError, "'Collection' object is not iterable"):
+            _ = next(coll)
+        # .next() fails
+        with self.assertRaisesRegex(TypeError, "'Collection' object is not iterable"):
+            _ = coll.next()
+        # Do not implement typing.Iterable.
+        self.assertNotIsInstance(coll, Iterable)
 
 
 class TestCollection(IntegrationTest):
@@ -295,6 +314,10 @@ class TestCollection(IntegrationTest):
 
         with self.write_concern_collection() as coll:
             coll.create_index([("hello", DESCENDING)])
+
+        db.test.create_index(["hello", "world"])
+        db.test.create_index(["hello", ("world", DESCENDING)])
+        db.test.create_index({"hello": 1}.items())  # type:ignore[arg-type]
 
     def test_drop_index(self):
         db = self.db
@@ -766,7 +789,7 @@ class TestCollection(IntegrationTest):
             db.test.insert_many(1)  # type: ignore[arg-type]
 
         with self.assertRaisesRegex(TypeError, "documents must be a non-empty list"):
-            db.test.insert_many(RawBSONDocument(encode({"_id": 2})))  # type: ignore[arg-type]
+            db.test.insert_many(RawBSONDocument(encode({"_id": 2})))
 
     def test_delete_one(self):
         self.db.test.drop()
@@ -1401,16 +1424,7 @@ class TestCollection(IntegrationTest):
     def test_acknowledged_delete(self):
         db = self.db
         db.drop_collection("test")
-        db.create_collection("test", capped=True, size=1000)
-
-        db.test.insert_one({"x": 1})
-        self.assertEqual(1, db.test.count_documents({}))
-
-        # Can't remove from capped collection.
-        self.assertRaises(OperationFailure, db.test.delete_one, {"x": 1})
-        db.drop_collection("test")
-        db.test.insert_one({"x": 1})
-        db.test.insert_one({"x": 1})
+        db.test.insert_many([{"x": 1}, {"x": 1}])
         self.assertEqual(2, db.test.delete_many({}).deleted_count)
         self.assertEqual(0, db.test.delete_many({}).deleted_count)
 
@@ -1527,6 +1541,13 @@ class TestCollection(IntegrationTest):
                 break
 
             self.assertTrue(cursor.alive)
+
+    def test_invalid_session_parameter(self):
+        def try_invalid_session():
+            with self.db.test.aggregate([], {}):  # type:ignore
+                pass
+
+        self.assertRaisesRegex(ValueError, "must be a ClientSession", try_invalid_session)
 
     def test_large_limit(self):
         db = self.db
@@ -1663,7 +1684,7 @@ class TestCollection(IntegrationTest):
 
         self.assertRaises(TypeError, db.test.find, sort=5)
         self.assertRaises(TypeError, db.test.find, sort="hello")
-        self.assertRaises(ValueError, db.test.find, sort=["hello", 1])
+        self.assertRaises(TypeError, db.test.find, sort=["hello", 1])
 
     # TODO doesn't actually test functionality, just that it doesn't blow up
     def test_cursor_timeout(self):
@@ -1969,21 +1990,20 @@ class TestCollection(IntegrationTest):
         c_w0 = db.get_collection("test", write_concern=WriteConcern(w=0))
         # default WriteConcern.
         c_default = db.get_collection("test", write_concern=WriteConcern())
-        results = listener.results
         # Authenticate the client and throw out auth commands from the listener.
         db.command("ping")
-        results.clear()
+        listener.reset()
         c_w0.find_one_and_update({"_id": 1}, {"$set": {"foo": "bar"}})
-        self.assertEqual({"w": 0}, results["started"][0].command["writeConcern"])
-        results.clear()
+        self.assertEqual({"w": 0}, listener.started_events[0].command["writeConcern"])
+        listener.reset()
 
         c_w0.find_one_and_replace({"_id": 1}, {"foo": "bar"})
-        self.assertEqual({"w": 0}, results["started"][0].command["writeConcern"])
-        results.clear()
+        self.assertEqual({"w": 0}, listener.started_events[0].command["writeConcern"])
+        listener.reset()
 
         c_w0.find_one_and_delete({"_id": 1})
-        self.assertEqual({"w": 0}, results["started"][0].command["writeConcern"])
-        results.clear()
+        self.assertEqual({"w": 0}, listener.started_events[0].command["writeConcern"])
+        listener.reset()
 
         # Test write concern errors.
         if client_context.is_rs:
@@ -2000,27 +2020,27 @@ class TestCollection(IntegrationTest):
                 WriteConcernError,
                 c_wc_error.find_one_and_replace,
                 {"w": 0},
-                results["started"][0].command["writeConcern"],
+                listener.started_events[0].command["writeConcern"],
             )
             self.assertRaises(
                 WriteConcernError,
                 c_wc_error.find_one_and_delete,
                 {"w": 0},
-                results["started"][0].command["writeConcern"],
+                listener.started_events[0].command["writeConcern"],
             )
-            results.clear()
+            listener.reset()
 
         c_default.find_one_and_update({"_id": 1}, {"$set": {"foo": "bar"}})
-        self.assertNotIn("writeConcern", results["started"][0].command)
-        results.clear()
+        self.assertNotIn("writeConcern", listener.started_events[0].command)
+        listener.reset()
 
         c_default.find_one_and_replace({"_id": 1}, {"foo": "bar"})
-        self.assertNotIn("writeConcern", results["started"][0].command)
-        results.clear()
+        self.assertNotIn("writeConcern", listener.started_events[0].command)
+        listener.reset()
 
         c_default.find_one_and_delete({"_id": 1})
-        self.assertNotIn("writeConcern", results["started"][0].command)
-        results.clear()
+        self.assertNotIn("writeConcern", listener.started_events[0].command)
+        listener.reset()
 
     def test_find_with_nested(self):
         c = self.db.test
@@ -2121,7 +2141,7 @@ class TestCollection(IntegrationTest):
             (c.update_one, ({}, {"$inc": {"x": 3}})),
             (c.find_one_and_delete, ({}, {})),
             (c.find_one_and_replace, ({}, {})),
-            (c.aggregate, ([], {})),
+            (c.aggregate, ([],)),
         ]
         for let in [10, "str", [], False]:
             for helper, args in helpers:

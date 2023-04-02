@@ -14,7 +14,6 @@
 
 """Cursor class to iterate over Mongo query results."""
 import copy
-import threading
 import warnings
 from collections import deque
 from typing import (
@@ -45,6 +44,7 @@ from pymongo.common import (
     validate_is_mapping,
 )
 from pymongo.errors import ConnectionFailure, InvalidOperation, OperationFailure
+from pymongo.lock import _create_lock
 from pymongo.message import (
     _CursorAddress,
     _GetMore,
@@ -133,7 +133,7 @@ class _SocketManager(object):
         self.sock = sock
         self.more_to_come = more_to_come
         self.closed = False
-        self.lock = threading.Lock()
+        self.lock = _create_lock()
 
     def update_exhaust(self, more_to_come):
         self.more_to_come = more_to_come
@@ -146,7 +146,7 @@ class _SocketManager(object):
             self.sock = None
 
 
-_Sort = Sequence[Tuple[str, Union[int, str, Mapping[str, Any]]]]
+_Sort = Sequence[Union[str, Tuple[str, Union[int, str, Mapping[str, Any]]]]]
 _Hint = Union[str, _Sort]
 
 
@@ -223,7 +223,7 @@ class Cursor(Generic[_DocumentType]):
                 "use an explicit session with no_cursor_timeout=True "
                 "otherwise the cursor may still timeout after "
                 "30 minutes, for more info see "
-                "https://docs.mongodb.com/v4.4/reference/method/"
+                "https://mongodb.com/docs/v4.4/reference/method/"
                 "cursor.noCursorTimeout/"
                 "#session-idle-timeout-overrides-nocursortimeout",
                 UserWarning,
@@ -832,15 +832,16 @@ class Cursor(Generic[_DocumentType]):
         """Sorts this cursor's results.
 
         Pass a field name and a direction, either
-        :data:`~pymongo.ASCENDING` or :data:`~pymongo.DESCENDING`::
+        :data:`~pymongo.ASCENDING` or :data:`~pymongo.DESCENDING`.::
 
             for doc in collection.find().sort('field', pymongo.ASCENDING):
                 print(doc)
 
-        To sort by multiple fields, pass a list of (key, direction) pairs::
+        To sort by multiple fields, pass a list of (key, direction) pairs.
+        If just a name is given, :data:`~pymongo.ASCENDING` will be inferred::
 
             for doc in collection.find().sort([
-                    ('field1', pymongo.ASCENDING),
+                    'field1',
                     ('field2', pymongo.DESCENDING)]):
                 print(doc)
 
@@ -908,7 +909,7 @@ class Cursor(Generic[_DocumentType]):
 
         .. note:: This method uses the default verbosity mode of the
           `explain command
-          <https://docs.mongodb.com/manual/reference/command/explain/>`_,
+          <https://mongodb.com/docs/manual/reference/command/explain/>`_,
           ``allPlansExecution``. To use a different verbosity use
           :meth:`~pymongo.database.Database.command` to run the explain
           command directly.
@@ -961,7 +962,7 @@ class Cursor(Generic[_DocumentType]):
     def comment(self, comment: Any) -> "Cursor[_DocumentType]":
         """Adds a 'comment' to the cursor.
 
-        http://docs.mongodb.org/manual/reference/operator/comment/
+        http://mongodb.com/docs/manual/reference/operator/comment/
 
         :Parameters:
           - `comment`: A string to attach to the query to help interpret and
@@ -1000,8 +1001,8 @@ class Cursor(Generic[_DocumentType]):
         :Parameters:
           - `code`: JavaScript expression to use as a filter
 
-        .. _$expr: https://docs.mongodb.com/manual/reference/operator/query/expr/
-        .. _$where: https://docs.mongodb.com/manual/reference/operator/query/where/
+        .. _$expr: https://mongodb.com/docs/manual/reference/operator/query/expr/
+        .. _$where: https://mongodb.com/docs/manual/reference/operator/query/where/
         """
         self.__check_okay_to_chain()
         if not isinstance(code, Code):
@@ -1194,7 +1195,7 @@ class Cursor(Generic[_DocumentType]):
         """Does this cursor have the potential to return more data?
 
         This is mostly useful with `tailable cursors
-        <http://www.mongodb.org/display/DOCS/Tailable+Cursors>`_
+        <https://www.mongodb.com/docs/manual/core/tailable-cursors/>`_
         since they will stop iterating even though they *may* return more
         results in the future.
 

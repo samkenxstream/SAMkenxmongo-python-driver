@@ -30,6 +30,8 @@ MongoDB, you can start it like so:
    mod_wsgi
    server_selection
    tailable
+   timeouts
    tls
+   type_hints
    encryption
    uuid

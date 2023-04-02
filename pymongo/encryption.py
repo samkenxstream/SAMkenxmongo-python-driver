@@ -15,9 +15,11 @@
 """Support for explicit client-side field level encryption."""
 
 import contextlib
-import uuid
+import enum
+import socket
 import weakref
-from typing import Any, Mapping, Optional, Sequence
+from copy import deepcopy
+from typing import Any, Generic, Mapping, Optional, Sequence, Tuple
 
 try:
     from pymongocrypt.auto_encrypter import AutoEncrypter
@@ -37,18 +39,27 @@ from bson.codec_options import CodecOptions
 from bson.errors import BSONError
 from bson.raw_bson import DEFAULT_RAW_BSON_OPTIONS, RawBSONDocument, _inflate_bson
 from bson.son import SON
+from pymongo import _csot
+from pymongo.collection import Collection
+from pymongo.cursor import Cursor
 from pymongo.daemon import _spawn_daemon
-from pymongo.encryption_options import AutoEncryptionOpts
+from pymongo.database import Database
+from pymongo.encryption_options import AutoEncryptionOpts, RangeOpts
 from pymongo.errors import (
     ConfigurationError,
+    EncryptedCollectionError,
     EncryptionError,
     InvalidOperation,
     ServerSelectionTimeoutError,
 )
 from pymongo.mongo_client import MongoClient
+from pymongo.network import BLOCKING_IO_ERRORS
+from pymongo.operations import UpdateOne
 from pymongo.pool import PoolOptions, _configured_socket
 from pymongo.read_concern import ReadConcern
+from pymongo.results import BulkWriteResult, DeleteResult
 from pymongo.ssl_support import get_ssl_context
+from pymongo.typings import _DocumentType
 from pymongo.uri_parser import parse_host
 from pymongo.write_concern import WriteConcern
 
@@ -56,10 +67,11 @@ _HTTPS_PORT = 443
 _KMS_CONNECT_TIMEOUT = 10  # TODO: CDRIVER-3262 will define this value.
 _MONGOCRYPTD_TIMEOUT_MS = 10000
 
+
 _DATA_KEY_OPTS: CodecOptions = CodecOptions(document_class=SON, uuid_representation=STANDARD)
 # Use RawBSONDocument codec options to avoid needlessly decoding
 # documents from the key vault.
-_KEY_VAULT_OPTS = CodecOptions(document_class=RawBSONDocument, uuid_representation=STANDARD)
+_KEY_VAULT_OPTS = CodecOptions(document_class=RawBSONDocument)
 
 
 @contextlib.contextmanager
@@ -118,9 +130,11 @@ class _EncryptionIO(MongoCryptCallback):  # type: ignore
                 False,  # allow_invalid_hostnames
                 False,
             )  # disable_ocsp_endpoint_check
+        # CSOT: set timeout for socket creation.
+        connect_timeout = max(_csot.clamp_remaining(_KMS_CONNECT_TIMEOUT), 0.001)
         opts = PoolOptions(
-            connect_timeout=_KMS_CONNECT_TIMEOUT,
-            socket_timeout=_KMS_CONNECT_TIMEOUT,
+            connect_timeout=connect_timeout,
+            socket_timeout=connect_timeout,
             ssl_context=ctx,
         )
         host, port = parse_host(endpoint, _HTTPS_PORT)
@@ -128,10 +142,14 @@ class _EncryptionIO(MongoCryptCallback):  # type: ignore
         try:
             conn.sendall(message)
             while kms_context.bytes_needed > 0:
+                # CSOT: update timeout.
+                conn.settimeout(max(_csot.clamp_remaining(_KMS_CONNECT_TIMEOUT), 0))
                 data = conn.recv(kms_context.bytes_needed)
                 if not data:
                     raise OSError("KMS connection closed")
                 kms_context.feed(data)
+        except BLOCKING_IO_ERRORS:
+            raise socket.timeout("timed out")
         finally:
             conn.close()
 
@@ -215,11 +233,11 @@ class _EncryptionIO(MongoCryptCallback):  # type: ignore
         """
         raw_doc = RawBSONDocument(data_key, _KEY_VAULT_OPTS)
         data_key_id = raw_doc.get("_id")
-        if not isinstance(data_key_id, uuid.UUID):
-            raise TypeError("data_key _id must be a UUID")
+        if not isinstance(data_key_id, Binary) or data_key_id.subtype != UUID_SUBTYPE:
+            raise TypeError("data_key _id must be Binary with a UUID subtype")
 
         self.key_vault_coll.insert_one(raw_doc)
-        return Binary(data_key_id.bytes, subtype=UUID_SUBTYPE)
+        return data_key_id
 
     def bson_encode(self, doc):
         """Encode a document to BSON.
@@ -246,6 +264,26 @@ class _EncryptionIO(MongoCryptCallback):  # type: ignore
             self.mongocryptd_client = None
 
 
+class RewrapManyDataKeyResult(object):
+    """Result object returned by a :meth:`~ClientEncryption.rewrap_many_data_key` operation.
+
+    .. versionadded:: 4.2
+    """
+
+    def __init__(self, bulk_write_result: Optional[BulkWriteResult] = None) -> None:
+        self._bulk_write_result = bulk_write_result
+
+    @property
+    def bulk_write_result(self) -> Optional[BulkWriteResult]:
+        """The result of the bulk write operation used to update the key vault
+        collection with one or more rewrapped data keys. If
+        :meth:`~ClientEncryption.rewrap_many_data_key` does not find any matching keys to rewrap,
+        no bulk write operation will be executed and this field will be
+        ``None``.
+        """
+        return self._bulk_write_result
+
+
 class _Encrypter(object):
     """Encrypts and decrypts MongoDB commands.
 
@@ -263,6 +301,11 @@ class _Encrypter(object):
             schema_map = None
         else:
             schema_map = _dict_to_bson(opts._schema_map, False, _DATA_KEY_OPTS)
+
+        if opts._encrypted_fields_map is None:
+            encrypted_fields_map = None
+        else:
+            encrypted_fields_map = _dict_to_bson(opts._encrypted_fields_map, False, _DATA_KEY_OPTS)
         self._bypass_auto_encryption = opts._bypass_auto_encryption
         self._internal_client = None
 
@@ -296,7 +339,16 @@ class _Encrypter(object):
 
         io_callbacks = _EncryptionIO(metadata_client, key_vault_coll, mongocryptd_client, opts)
         self._auto_encrypter = AutoEncrypter(
-            io_callbacks, MongoCryptOptions(opts._kms_providers, schema_map)
+            io_callbacks,
+            MongoCryptOptions(
+                opts._kms_providers,
+                schema_map,
+                crypt_shared_lib_path=opts._crypt_shared_lib_path,
+                crypt_shared_lib_required=opts._crypt_shared_lib_required,
+                bypass_encryption=opts._bypass_auto_encryption,
+                encrypted_fields_map=encrypted_fields_map,
+                bypass_query_analysis=opts._bypass_query_analysis,
+            ),
         )
         self._closed = False
 
@@ -345,14 +397,56 @@ class _Encrypter(object):
             self._internal_client = None
 
 
-class Algorithm(object):
+class Algorithm(str, enum.Enum):
     """An enum that defines the supported encryption algorithms."""
 
     AEAD_AES_256_CBC_HMAC_SHA_512_Deterministic = "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+    """AEAD_AES_256_CBC_HMAC_SHA_512_Deterministic."""
     AEAD_AES_256_CBC_HMAC_SHA_512_Random = "AEAD_AES_256_CBC_HMAC_SHA_512-Random"
+    """AEAD_AES_256_CBC_HMAC_SHA_512_Random."""
+    INDEXED = "Indexed"
+    """Indexed.
+
+    .. note:: Support for Queryable Encryption is in beta.
+       Backwards-breaking changes may be made before the final release.
+
+    .. versionadded:: 4.2
+    """
+    UNINDEXED = "Unindexed"
+    """Unindexed.
+
+    .. note:: Support for Queryable Encryption is in beta.
+       Backwards-breaking changes may be made before the final release.
+
+    .. versionadded:: 4.2
+    """
+    RANGEPREVIEW = "RangePreview"
+    """RangePreview.
+
+    .. note:: Support for Range queries is in beta.
+       Backwards-breaking changes may be made before the final release.
+
+    .. versionadded:: 4.4
+    """
 
 
-class ClientEncryption(object):
+class QueryType(str, enum.Enum):
+    """**(BETA)** An enum that defines the supported values for explicit encryption query_type.
+
+    .. note:: Support for Queryable Encryption is in beta.
+       Backwards-breaking changes may be made before the final release.
+
+    .. versionadded:: 4.2
+    """
+
+    EQUALITY = "equality"
+    """Used to encrypt a value for an equality query."""
+
+    RANGEPREVIEW = "rangePreview"
+    """Used to encrypt a value for a range query."""
+
+
+class ClientEncryption(Generic[_DocumentType]):
     """Explicit client-side field level encryption."""
 
     def __init__(
@@ -459,12 +553,103 @@ class ClientEncryption(object):
         self._encryption = ExplicitEncrypter(
             self._io_callbacks, MongoCryptOptions(kms_providers, None)
         )
+        # Use the same key vault collection as the callback.
+        self._key_vault_coll = self._io_callbacks.key_vault_coll
+
+    def create_encrypted_collection(
+        self,
+        database: Database,
+        name: str,
+        encrypted_fields: Mapping[str, Any],
+        kms_provider: Optional[str] = None,
+        master_key: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[Collection[_DocumentType], Mapping[str, Any]]:
+        """Create a collection with encryptedFields.
+
+        .. note:: Support for Queryable Encryption is in beta.
+           Backwards-breaking changes may be made before the final release.
+
+        .. warning::
+            This function does not update the encryptedFieldsMap in the client's
+            AutoEncryptionOpts, thus the user must create a new client after calling this function with
+            the encryptedFields returned.
+
+        Normally collection creation is automatic. This method should
+        only be used to specify options on
+        creation. :class:`~pymongo.errors.EncryptionError` will be
+        raised if the collection already exists.
+
+        :Parameters:
+          - `name`: the name of the collection to create
+          - `encrypted_fields` (dict): **(BETA)** Document that describes the encrypted fields for
+            Queryable Encryption. For example::
+
+              {
+                "escCollection": "enxcol_.encryptedCollection.esc",
+                "eccCollection": "enxcol_.encryptedCollection.ecc",
+                "ecocCollection": "enxcol_.encryptedCollection.ecoc",
+                "fields": [
+                    {
+                        "path": "firstName",
+                        "keyId": Binary.from_uuid(UUID('00000000-0000-0000-0000-000000000000')),
+                        "bsonType": "string",
+                        "queries": {"queryType": "equality"}
+                    },
+                    {
+                        "path": "ssn",
+                        "keyId": Binary.from_uuid(UUID('04104104-1041-0410-4104-104104104104')),
+                        "bsonType": "string"
+                    }
+                  ]
+              }
+
+            The "keyId" may be set to ``None`` to auto-generate the data keys.
+          - `kms_provider` (optional): the KMS provider to be used
+          - `master_key` (optional): Identifies a KMS-specific key used to encrypt the
+            new data key. If the kmsProvider is "local" the `master_key` is
+            not applicable and may be omitted.
+          - `**kwargs` (optional): additional keyword arguments are the same as "create_collection".
+
+        All optional `create collection command`_ parameters should be passed
+        as keyword arguments to this method.
+        See the documentation for :meth:`~pymongo.database.Database.create_collection` for all valid options.
+
+        :Raises:
+          - :class:`~pymongo.errors.EncryptedCollectionError`: When either data-key creation or creating the collection fails.
+
+        .. versionadded:: 4.4
+
+        .. _create collection command:
+            https://mongodb.com/docs/manual/reference/command/create
+
+        """
+        encrypted_fields = deepcopy(encrypted_fields)
+        for i, field in enumerate(encrypted_fields["fields"]):
+            if isinstance(field, dict) and field.get("keyId") is None:
+                try:
+                    encrypted_fields["fields"][i]["keyId"] = self.create_data_key(
+                        kms_provider=kms_provider,  # type:ignore[arg-type]
+                        master_key=master_key,
+                    )
+                except EncryptionError as exc:
+                    raise EncryptedCollectionError(exc, encrypted_fields) from exc
+        kwargs["encryptedFields"] = encrypted_fields
+        kwargs["check_exists"] = False
+        try:
+            return (
+                database.create_collection(name=name, **kwargs),
+                encrypted_fields,
+            )
+        except Exception as exc:
+            raise EncryptedCollectionError(exc, encrypted_fields) from exc
 
     def create_data_key(
         self,
         kms_provider: str,
         master_key: Optional[Mapping[str, Any]] = None,
         key_alt_names: Optional[Sequence[str]] = None,
+        key_material: Optional[bytes] = None,
     ) -> Binary:
         """Create and insert a new data key into the key vault collection.
 
@@ -521,21 +706,68 @@ class ClientEncryption(object):
             name instead of by ``key_id``. The following example shows creating
             and referring to a data key by alternate name::
 
-              client_encryption.create_data_key("local", keyAltNames=["name1"])
+              client_encryption.create_data_key("local", key_alt_names=["name1"])
               # reference the key with the alternate name
-              client_encryption.encrypt("457-55-5462", keyAltName="name1",
+              client_encryption.encrypt("457-55-5462", key_alt_name="name1",
                                         algorithm=Algorithm.AEAD_AES_256_CBC_HMAC_SHA_512_Random)
+          - `key_material` (optional): Sets the custom key material to be used
+            by the data key for encryption and decryption.
 
         :Returns:
           The ``_id`` of the created data key document as a
           :class:`~bson.binary.Binary` with subtype
           :data:`~bson.binary.UUID_SUBTYPE`.
+
+        .. versionchanged:: 4.2
+           Added the `key_material` parameter.
         """
         self._check_closed()
         with _wrap_encryption_errors():
             return self._encryption.create_data_key(
-                kms_provider, master_key=master_key, key_alt_names=key_alt_names
+                kms_provider,
+                master_key=master_key,
+                key_alt_names=key_alt_names,
+                key_material=key_material,
             )
+
+    def _encrypt_helper(
+        self,
+        value,
+        algorithm,
+        key_id=None,
+        key_alt_name=None,
+        query_type=None,
+        contention_factor=None,
+        range_opts=None,
+        is_expression=False,
+    ):
+        self._check_closed()
+        if key_id is not None and not (
+            isinstance(key_id, Binary) and key_id.subtype == UUID_SUBTYPE
+        ):
+            raise TypeError("key_id must be a bson.binary.Binary with subtype 4")
+
+        doc = encode(
+            {"v": value},
+            codec_options=self._codec_options,
+        )
+        if range_opts:
+            range_opts = encode(
+                range_opts.document,
+                codec_options=self._codec_options,
+            )
+        with _wrap_encryption_errors():
+            encrypted_doc = self._encryption.encrypt(
+                value=doc,
+                algorithm=algorithm,
+                key_id=key_id,
+                key_alt_name=key_alt_name,
+                query_type=query_type,
+                contention_factor=contention_factor,
+                range_opts=range_opts,
+                is_expression=is_expression,
+            )
+            return decode(encrypted_doc)["v"]  # type: ignore[index]
 
     def encrypt(
         self,
@@ -543,6 +775,9 @@ class ClientEncryption(object):
         algorithm: str,
         key_id: Optional[Binary] = None,
         key_alt_name: Optional[str] = None,
+        query_type: Optional[str] = None,
+        contention_factor: Optional[int] = None,
+        range_opts: Optional[RangeOpts] = None,
     ) -> Binary:
         """Encrypt a BSON value with a given key and algorithm.
 
@@ -557,22 +792,84 @@ class ClientEncryption(object):
             :class:`~bson.binary.Binary` with subtype 4 (
             :attr:`~bson.binary.UUID_SUBTYPE`).
           - `key_alt_name`: Identifies a key vault document by 'keyAltName'.
+          - `query_type` (str): **(BETA)** The query type to execute. See
+            :class:`QueryType` for valid options.
+          - `contention_factor` (int): **(BETA)** The contention factor to use
+            when the algorithm is :attr:`Algorithm.INDEXED`.  An integer value
+            *must* be given when the :attr:`Algorithm.INDEXED` algorithm is
+            used.
+          - `range_opts`: **(BETA)** An instance of RangeOpts.
+
+        .. note:: `query_type`, `contention_factor` and `range_opts` are part of the Queryable Encryption beta.
+           Backwards-breaking changes may be made before the final release.
 
         :Returns:
           The encrypted value, a :class:`~bson.binary.Binary` with subtype 6.
-        """
-        self._check_closed()
-        if key_id is not None and not (
-            isinstance(key_id, Binary) and key_id.subtype == UUID_SUBTYPE
-        ):
-            raise TypeError("key_id must be a bson.binary.Binary with subtype 4")
 
-        doc = encode({"v": value}, codec_options=self._codec_options)
-        with _wrap_encryption_errors():
-            encrypted_doc = self._encryption.encrypt(
-                doc, algorithm, key_id=key_id, key_alt_name=key_alt_name
-            )
-            return decode(encrypted_doc)["v"]  # type: ignore[index]
+        .. versionchanged:: 4.2
+           Added the `query_type` and `contention_factor` parameters.
+
+        """
+        return self._encrypt_helper(
+            value=value,
+            algorithm=algorithm,
+            key_id=key_id,
+            key_alt_name=key_alt_name,
+            query_type=query_type,
+            contention_factor=contention_factor,
+            range_opts=range_opts,
+            is_expression=False,
+        )
+
+    def encrypt_expression(
+        self,
+        expression: Mapping[str, Any],
+        algorithm: str,
+        key_id: Optional[Binary] = None,
+        key_alt_name: Optional[str] = None,
+        query_type: Optional[str] = None,
+        contention_factor: Optional[int] = None,
+        range_opts: Optional[RangeOpts] = None,
+    ) -> RawBSONDocument:
+        """Encrypt a BSON expression with a given key and algorithm.
+
+        Note that exactly one of ``key_id`` or  ``key_alt_name`` must be
+        provided.
+
+        :Parameters:
+          - `expression`: **(BETA)** The BSON aggregate or match expression to encrypt.
+          - `algorithm` (string): The encryption algorithm to use. See
+            :class:`Algorithm` for some valid options.
+          - `key_id`: Identifies a data key by ``_id`` which must be a
+            :class:`~bson.binary.Binary` with subtype 4 (
+            :attr:`~bson.binary.UUID_SUBTYPE`).
+          - `key_alt_name`: Identifies a key vault document by 'keyAltName'.
+          - `query_type` (str): **(BETA)** The query type to execute. See
+            :class:`QueryType` for valid options.
+          - `contention_factor` (int): **(BETA)** The contention factor to use
+            when the algorithm is :attr:`Algorithm.INDEXED`.  An integer value
+            *must* be given when the :attr:`Algorithm.INDEXED` algorithm is
+            used.
+          - `range_opts`: **(BETA)** An instance of RangeOpts.
+
+        .. note:: Support for range queries is in beta.
+           Backwards-breaking changes may be made before the final release.
+
+        :Returns:
+          The encrypted expression, a :class:`~bson.RawBSONDocument`.
+
+        .. versionadded:: 4.4
+        """
+        return self._encrypt_helper(
+            value=expression,
+            algorithm=algorithm,
+            key_id=key_id,
+            key_alt_name=key_alt_name,
+            query_type=query_type,
+            contention_factor=contention_factor,
+            range_opts=range_opts,
+            is_expression=True,
+        )
 
     def decrypt(self, value: Binary) -> Any:
         """Decrypt an encrypted value.
@@ -592,6 +889,176 @@ class ClientEncryption(object):
             doc = encode({"v": value})
             decrypted_doc = self._encryption.decrypt(doc)
             return decode(decrypted_doc, codec_options=self._codec_options)["v"]
+
+    def get_key(self, id: Binary) -> Optional[RawBSONDocument]:
+        """Get a data key by id.
+
+        :Parameters:
+          - `id` (Binary): The UUID of a key a which must be a
+            :class:`~bson.binary.Binary` with subtype 4 (
+            :attr:`~bson.binary.UUID_SUBTYPE`).
+
+        :Returns:
+          The key document.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        return self._key_vault_coll.find_one({"_id": id})
+
+    def get_keys(self) -> Cursor[RawBSONDocument]:
+        """Get all of the data keys.
+
+        :Returns:
+          An instance of :class:`~pymongo.cursor.Cursor` over the data key
+          documents.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        return self._key_vault_coll.find({})
+
+    def delete_key(self, id: Binary) -> DeleteResult:
+        """Delete a key document in the key vault collection that has the given ``key_id``.
+
+        :Parameters:
+          - `id` (Binary): The UUID of a key a which must be a
+            :class:`~bson.binary.Binary` with subtype 4 (
+            :attr:`~bson.binary.UUID_SUBTYPE`).
+
+        :Returns:
+          The delete result.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        return self._key_vault_coll.delete_one({"_id": id})
+
+    def add_key_alt_name(self, id: Binary, key_alt_name: str) -> Any:
+        """Add ``key_alt_name`` to the set of alternate names in the key document with UUID ``key_id``.
+
+        :Parameters:
+          - ``id``: The UUID of a key a which must be a
+            :class:`~bson.binary.Binary` with subtype 4 (
+            :attr:`~bson.binary.UUID_SUBTYPE`).
+          - ``key_alt_name``: The key alternate name to add.
+
+        :Returns:
+          The previous version of the key document.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        update = {"$addToSet": {"keyAltNames": key_alt_name}}
+        return self._key_vault_coll.find_one_and_update({"_id": id}, update)
+
+    def get_key_by_alt_name(self, key_alt_name: str) -> Optional[RawBSONDocument]:
+        """Get a key document in the key vault collection that has the given ``key_alt_name``.
+
+        :Parameters:
+          - `key_alt_name`: (str): The key alternate name of the key to get.
+
+        :Returns:
+          The key document.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        return self._key_vault_coll.find_one({"keyAltNames": key_alt_name})
+
+    def remove_key_alt_name(self, id: Binary, key_alt_name: str) -> Optional[RawBSONDocument]:
+        """Remove ``key_alt_name`` from the set of keyAltNames in the key document with UUID ``id``.
+
+        Also removes the ``keyAltNames`` field from the key document if it would otherwise be empty.
+
+        :Parameters:
+          - ``id``: The UUID of a key a which must be a
+            :class:`~bson.binary.Binary` with subtype 4 (
+            :attr:`~bson.binary.UUID_SUBTYPE`).
+          - ``key_alt_name``: The key alternate name to remove.
+
+        :Returns:
+          Returns the previous version of the key document.
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        pipeline = [
+            {
+                "$set": {
+                    "keyAltNames": {
+                        "$cond": [
+                            {"$eq": ["$keyAltNames", [key_alt_name]]},
+                            "$$REMOVE",
+                            {
+                                "$filter": {
+                                    "input": "$keyAltNames",
+                                    "cond": {"$ne": ["$$this", key_alt_name]},
+                                }
+                            },
+                        ]
+                    }
+                }
+            }
+        ]
+        return self._key_vault_coll.find_one_and_update({"_id": id}, pipeline)
+
+    def rewrap_many_data_key(
+        self,
+        filter: Mapping[str, Any],
+        provider: Optional[str] = None,
+        master_key: Optional[Mapping[str, Any]] = None,
+    ) -> RewrapManyDataKeyResult:
+        """Decrypts and encrypts all matching data keys in the key vault with a possibly new `master_key` value.
+
+        :Parameters:
+          - `filter`: A document used to filter the data keys.
+          - `provider`: The new KMS provider to use to encrypt the data keys,
+            or ``None`` to use the current KMS provider(s).
+          - ``master_key``: The master key fields corresponding to the new KMS
+            provider when ``provider`` is not ``None``.
+
+        :Returns:
+          A :class:`RewrapManyDataKeyResult`.
+
+        This method allows you to re-encrypt all of your data-keys with a new CMK, or master key.
+        Note that this does *not* require re-encrypting any of the data in your encrypted collections,
+        but rather refreshes the key that protects the keys that encrypt the data:
+
+        .. code-block:: python
+
+           client_encryption.rewrap_many_data_key(
+               filter={"keyAltNames": "optional filter for which keys you want to update"},
+               master_key={
+                   "provider": "azure",  # replace with your cloud provider
+                   "master_key": {
+                       # put the rest of your master_key options here
+                       "key": "<your new key>"
+                   },
+               },
+           )
+
+        .. versionadded:: 4.2
+        """
+        self._check_closed()
+        with _wrap_encryption_errors():
+            raw_result = self._encryption.rewrap_many_data_key(filter, provider, master_key)
+            if raw_result is None:
+                return RewrapManyDataKeyResult()
+
+        raw_doc = RawBSONDocument(raw_result, DEFAULT_RAW_BSON_OPTIONS)
+        replacements = []
+        for key in raw_doc["v"]:
+            update_model = {
+                "$set": {"keyMaterial": key["keyMaterial"], "masterKey": key["masterKey"]},
+                "$currentDate": {"updateDate": True},
+            }
+            op = UpdateOne({"_id": key["_id"]}, update_model)
+            replacements.append(op)
+        if not replacements:
+            return RewrapManyDataKeyResult()
+        result = self._key_vault_coll.bulk_write(replacements)
+        return RewrapManyDataKeyResult(result)
 
     def __enter__(self) -> "ClientEncryption":
         return self

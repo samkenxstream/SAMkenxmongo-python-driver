@@ -18,7 +18,7 @@ import unittest
 from typing import Any
 
 from mockupdb import CommandBase, MockupDB, going
-from operations import operations
+from operations import operations  # type: ignore[import]
 
 from pymongo import MongoClient, ReadPreference
 from pymongo.read_preferences import (

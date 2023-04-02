@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Tools for creating `messages
-<http://www.mongodb.org/display/DOCS/Mongo+Wire+Protocol>`_ to be sent to
+<https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/>`_ to be sent to
 MongoDB.
 
 .. note:: This module is for internal use and is generally not needed by
@@ -24,12 +24,17 @@ import datetime
 import random
 import struct
 from io import BytesIO as _BytesIO
-from typing import Any, Dict, NoReturn
+from typing import Any, Mapping, NoReturn
 
 import bson
 from bson import CodecOptions, _decode_selective, _dict_to_bson, _make_c_string, encode
 from bson.int64 import Int64
-from bson.raw_bson import DEFAULT_RAW_BSON_OPTIONS, RawBSONDocument, _inflate_bson
+from bson.raw_bson import (
+    _RAW_ARRAY_BSON_OPTIONS,
+    DEFAULT_RAW_BSON_OPTIONS,
+    RawBSONDocument,
+    _inflate_bson,
+)
 from bson.son import SON
 
 try:
@@ -76,7 +81,7 @@ _OP_MAP = {
 }
 _FIELD_MAP = {"insert": "documents", "update": "updates", "delete": "deletes"}
 
-_UNICODE_REPLACE_CODEC_OPTIONS: "CodecOptions[Dict[str, Any]]" = CodecOptions(
+_UNICODE_REPLACE_CODEC_OPTIONS: "CodecOptions[Mapping[str, Any]]" = CodecOptions(
     unicode_decode_error_handler="replace"
 )
 
@@ -300,6 +305,9 @@ class _Query(object):
         self._as_command = None
         self.exhaust = exhaust
 
+    def reset(self):
+        self._as_command = None
+
     def namespace(self):
         return "%s.%s" % (self.db, self.coll)
 
@@ -320,7 +328,7 @@ class _Query(object):
         sock_info.validate_session(self.client, self.session)
         return use_find_cmd
 
-    def as_command(self, sock_info):
+    def as_command(self, sock_info, apply_timeout=False):
         """Return a find command document for this query."""
         # We use the command twice: on the wire and for command monitoring.
         # Generate it once, for speed and to avoid repeating side-effects.
@@ -356,11 +364,16 @@ class _Query(object):
         client = self.client
         if client._encrypter and not client._encrypter._bypass_auto_encryption:
             cmd = client._encrypter.encrypt(self.db, cmd, self.codec_options)
+        # Support CSOT
+        if apply_timeout:
+            sock_info.apply_timeout(client, cmd)
         self._as_command = cmd, self.db
         return self._as_command
 
     def get_message(self, read_preference, sock_info, use_cmd=False):
         """Get a query message, possibly setting the secondaryOk bit."""
+        # Use the read_preference decided by _socket_from_server.
+        self.read_preference = read_preference
         if read_preference.mode:
             # Set the secondaryOk bit.
             flags = self.flags | 4
@@ -371,7 +384,7 @@ class _Query(object):
         spec = self.spec
 
         if use_cmd:
-            spec = self.as_command(sock_info)[0]
+            spec = self.as_command(sock_info, apply_timeout=True)[0]
             request_id, msg, size, _ = _op_msg(
                 0,
                 spec,
@@ -457,6 +470,9 @@ class _GetMore(object):
         self.exhaust = exhaust
         self.comment = comment
 
+    def reset(self):
+        self._as_command = None
+
     def namespace(self):
         return "%s.%s" % (self.db, self.coll)
 
@@ -471,7 +487,7 @@ class _GetMore(object):
         sock_info.validate_session(self.client, self.session)
         return use_cmd
 
-    def as_command(self, sock_info):
+    def as_command(self, sock_info, apply_timeout=False):
         """Return a getMore command document for this query."""
         # See _Query.as_command for an explanation of this caching.
         if self._as_command is not None:
@@ -493,6 +509,9 @@ class _GetMore(object):
         client = self.client
         if client._encrypter and not client._encrypter._bypass_auto_encryption:
             cmd = client._encrypter.encrypt(self.db, cmd, self.codec_options)
+        # Support CSOT
+        if apply_timeout:
+            sock_info.apply_timeout(client, cmd=None)
         self._as_command = cmd, self.db
         return self._as_command
 
@@ -503,7 +522,7 @@ class _GetMore(object):
         ctx = sock_info.compression_context
 
         if use_cmd:
-            spec = self.as_command(sock_info)[0]
+            spec = self.as_command(sock_info, apply_timeout=True)[0]
             if self.sock_mgr:
                 flags = _OpMsg.EXHAUST_ALLOWED
             else:
@@ -1365,7 +1384,7 @@ class _OpMsg(object):
         user_fields is used to determine which fields must not be decoded
         """
         inflated_response = _decode_selective(
-            RawBSONDocument(self.payload_document), user_fields, DEFAULT_RAW_BSON_OPTIONS
+            RawBSONDocument(self.payload_document), user_fields, _RAW_ARRAY_BSON_OPTIONS
         )
         return [inflated_response]
 

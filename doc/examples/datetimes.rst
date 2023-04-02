@@ -6,8 +6,9 @@ Datetimes and Timezones
    import datetime
    from pymongo import MongoClient
    from bson.codec_options import CodecOptions
+
    client = MongoClient()
-   client.drop_database('dt_example')
+   client.drop_database("dt_example")
    db = client.dt_example
 
 These examples show how to handle Python :class:`datetime.datetime` objects
@@ -24,8 +25,7 @@ time into MongoDB:
 
 .. doctest::
 
-   >>> result = db.objects.insert_one(
-   ...     {"last_modified": datetime.datetime.utcnow()})
+   >>> result = db.objects.insert_one({"last_modified": datetime.datetime.utcnow()})
 
 Always use :meth:`datetime.datetime.utcnow`, which returns the current time in
 UTC, instead of :meth:`datetime.datetime.now`, which returns the current local
@@ -33,8 +33,7 @@ time. Avoid doing this:
 
 .. doctest::
 
-   >>> result = db.objects.insert_one(
-   ...     {"last_modified": datetime.datetime.now()})
+   >>> result = db.objects.insert_one({"last_modified": datetime.datetime.now()})
 
 The value for `last_modified` is very different between these two examples, even
 though both documents were stored at around the same local time. This will be
@@ -42,7 +41,7 @@ confusing to the application that reads them:
 
 .. doctest::
 
-   >>> [doc['last_modified'] for doc in db.objects.find()]  # doctest: +SKIP
+   >>> [doc["last_modified"] for doc in db.objects.find()]  # doctest: +SKIP
    [datetime.datetime(2015, 7, 8, 18, 17, 28, 324000),
     datetime.datetime(2015, 7, 8, 11, 17, 42, 911000)]
 
@@ -52,12 +51,11 @@ timezone they're in. By default, PyMongo retrieves naive datetimes:
 
 .. doctest::
 
-   >>> result = db.tzdemo.insert_one(
-   ...     {'date': datetime.datetime(2002, 10, 27, 6, 0, 0)})
-   >>> db.tzdemo.find_one()['date']
+   >>> result = db.tzdemo.insert_one({"date": datetime.datetime(2002, 10, 27, 6, 0, 0)})
+   >>> db.tzdemo.find_one()["date"]
    datetime.datetime(2002, 10, 27, 6, 0)
    >>> options = CodecOptions(tz_aware=True)
-   >>> db.get_collection('tzdemo', codec_options=options).find_one()['date']  # doctest: +SKIP
+   >>> db.get_collection("tzdemo", codec_options=options).find_one()["date"]  # doctest: +SKIP
    datetime.datetime(2002, 10, 27, 6, 0,
                      tzinfo=<bson.tz_util.FixedOffset object at 0x10583a050>)
 
@@ -71,11 +69,10 @@ those datetimes to UTC automatically:
 .. doctest::
 
    >>> import pytz
-   >>> pacific = pytz.timezone('US/Pacific')
-   >>> aware_datetime = pacific.localize(
-   ...     datetime.datetime(2002, 10, 27, 6, 0, 0))
+   >>> pacific = pytz.timezone("US/Pacific")
+   >>> aware_datetime = pacific.localize(datetime.datetime(2002, 10, 27, 6, 0, 0))
    >>> result = db.times.insert_one({"date": aware_datetime})
-   >>> db.times.find_one()['date']
+   >>> db.times.find_one()["date"]
    datetime.datetime(2002, 10, 27, 14, 0)
 
 Reading Time
@@ -102,3 +99,77 @@ out of MongoDB in US/Pacific time:
    >>> result = aware_times.find_one()
    datetime.datetime(2002, 10, 27, 6, 0,  # doctest: +NORMALIZE_WHITESPACE
                      tzinfo=<DstTzInfo 'US/Pacific' PST-1 day, 16:00:00 STD>)
+
+.. _handling-out-of-range-datetimes:
+
+Handling out of range datetimes
+-------------------------------
+
+Python's :class:`~datetime.datetime` can only represent datetimes within the
+range allowed by
+:attr:`~datetime.datetime.min` and :attr:`~datetime.datetime.max`, whereas
+the range of datetimes allowed in BSON can represent any 64-bit number
+of milliseconds from the Unix epoch. To deal with this, we can use the
+:class:`bson.datetime_ms.DatetimeMS` object, which is a wrapper for the
+:class:`int` built-in.
+
+To decode UTC datetime values as :class:`~bson.datetime_ms.DatetimeMS`,
+:class:`~bson.codec_options.CodecOptions` should have its
+``datetime_conversion`` parameter set to one of the options available in
+:class:`bson.datetime_ms.DatetimeConversion`. These include
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME`,
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_MS`,
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_AUTO`,
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_CLAMP`.
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME` is the default
+option and has the behavior of raising an :class:`~builtin.OverflowError` upon
+attempting to decode an out-of-range date.
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_MS` will only return
+:class:`~bson.datetime_ms.DatetimeMS` objects, regardless of whether the
+represented datetime is in- or out-of-range:
+
+.. doctest::
+
+    >>> from datetime import datetime
+    >>> from bson import encode, decode
+    >>> from bson.datetime_ms import DatetimeMS
+    >>> from bson.codec_options import CodecOptions, DatetimeConversion
+    >>> x = encode({"x": datetime(1970, 1, 1)})
+    >>> codec_ms = CodecOptions(datetime_conversion=DatetimeConversion.DATETIME_MS)
+    >>> decode(x, codec_options=codec_ms)
+    {'x': DatetimeMS(0)}
+
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_AUTO` will return
+:class:`~datetime.datetime` if the underlying UTC datetime is within range,
+or :class:`~bson.datetime_ms.DatetimeMS` if the underlying datetime
+cannot be represented using the builtin Python :class:`~datetime.datetime`:
+
+.. doctest::
+
+    >>> x = encode({"x": datetime(1970, 1, 1)})
+    >>> y = encode({"x": DatetimeMS(-(2**62))})
+    >>> codec_auto = CodecOptions(datetime_conversion=DatetimeConversion.DATETIME_AUTO)
+    >>> decode(x, codec_options=codec_auto)
+    {'x': datetime.datetime(1970, 1, 1, 0, 0)}
+    >>> decode(y, codec_options=codec_auto)
+    {'x': DatetimeMS(-4611686018427387904)}
+
+:attr:`~bson.datetime_ms.DatetimeConversion.DATETIME_CLAMP` will clamp
+resulting :class:`~datetime.datetime` objects to be within
+:attr:`~datetime.datetime.min` and :attr:`~datetime.datetime.max`
+(trimmed to `999000` microseconds):
+
+.. doctest::
+
+    >>> x = encode({"x": DatetimeMS(2**62)})
+    >>> y = encode({"x": DatetimeMS(-(2**62))})
+    >>> codec_clamp = CodecOptions(datetime_conversion=DatetimeConversion.DATETIME_CLAMP)
+    >>> decode(x, codec_options=codec_clamp)
+    {'x': datetime.datetime(9999, 12, 31, 23, 59, 59, 999000)}
+    >>> decode(y, codec_options=codec_clamp)
+    {'x': datetime.datetime(1, 1, 1, 0, 0)}
+
+:class:`~bson.datetime_ms.DatetimeMS` objects have support for rich comparison
+methods against other instances of :class:`~bson.datetime_ms.DatetimeMS`.
+They can also be converted to :class:`~datetime.datetime` objects with
+:meth:`~bson.datetime_ms.DatetimeMS.to_datetime()`.

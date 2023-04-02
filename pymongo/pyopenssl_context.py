@@ -55,7 +55,6 @@ OP_NO_RENEGOTIATION = getattr(_SSL, "OP_NO_RENEGOTIATION", 0)
 
 # Always available
 HAS_SNI = True
-CHECK_HOSTNAME_SAFE = True
 IS_PYOPENSSL = True
 
 # Base Exception class
@@ -71,6 +70,8 @@ _VERIFY_MAP = {
 _REVERSE_VERIFY_MAP = dict((value, key) for key, value in _VERIFY_MAP.items())
 
 
+# For SNI support. According to RFC6066, section 3, IPv4 and IPv6 literals are
+# not permitted for SNI hostname.
 def _is_ip_address(address):
     try:
         _ip_address(address)
@@ -81,7 +82,7 @@ def _is_ip_address(address):
 
 # According to the docs for Connection.send it can raise
 # WantX509LookupError and should be retried.
-_RETRY_ERRORS = (_SSL.WantReadError, _SSL.WantWriteError, _SSL.WantX509LookupError)
+BLOCKING_IO_ERRORS = (_SSL.WantReadError, _SSL.WantWriteError, _SSL.WantX509LookupError)
 
 
 def _ragged_eof(exc):
@@ -105,8 +106,17 @@ class _sslConn(_SSL.Connection):
         while True:
             try:
                 return call(*args, **kwargs)
-            except _RETRY_ERRORS:
-                self.socket_checker.select(self, True, True, timeout)
+            except BLOCKING_IO_ERRORS as exc:
+                if isinstance(exc, _SSL.WantReadError):
+                    want_read = True
+                    want_write = False
+                elif isinstance(exc, _SSL.WantWriteError):
+                    want_read = False
+                    want_write = True
+                else:
+                    want_read = True
+                    want_write = True
+                self.socket_checker.select(self, want_read, want_write, timeout)
                 if timeout and _time.monotonic() - start > timeout:
                     raise _socket.timeout("timed out")
                 continue
@@ -125,7 +135,7 @@ class _sslConn(_SSL.Connection):
 
     def recv_into(self, *args, **kwargs):
         try:
-            return self._call(super(_sslConn, self).recv_into, *args, **kwargs)  # type: ignore
+            return self._call(super(_sslConn, self).recv_into, *args, **kwargs)
         except _SSL.SysCallError as exc:
             # Suppress ragged EOFs to match the stdlib.
             if self.suppress_ragged_eofs and _ragged_eof(exc):
@@ -136,12 +146,9 @@ class _sslConn(_SSL.Connection):
         view = memoryview(buf)
         total_length = len(buf)
         total_sent = 0
-        sent = 0
         while total_sent < total_length:
             try:
-                sent = self._call(
-                    super(_sslConn, self).send, view[total_sent:], flags  # type: ignore
-                )
+                sent = self._call(super(_sslConn, self).send, view[total_sent:], flags)
             # XXX: It's not clear if this can actually happen. PyOpenSSL
             # doesn't appear to have any interrupt handling, nor any interrupt
             # errors for OpenSSL connections.
@@ -152,7 +159,7 @@ class _sslConn(_SSL.Connection):
             # https://github.com/pyca/pyopenssl/blob/19.1.0/src/OpenSSL/SSL.py#L1756
             # https://www.openssl.org/docs/man1.0.2/man3/SSL_write.html
             if sent <= 0:
-                raise Exception("Connection closed")
+                raise OSError("connection closed")
             total_sent += sent
 
 

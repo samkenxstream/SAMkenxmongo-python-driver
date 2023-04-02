@@ -26,6 +26,7 @@ from test import IntegrationTest, SkipTest, client_context, client_knobs, unitte
 from test.utils import (
     CMAPListener,
     DeprecationFilter,
+    EventListener,
     OvertCommandListener,
     TestCreator,
     rs_or_single_client,
@@ -45,6 +46,7 @@ from pymongo.errors import (
 )
 from pymongo.mongo_client import MongoClient
 from pymongo.monitoring import (
+    CommandSucceededEvent,
     ConnectionCheckedOutEvent,
     ConnectionCheckOutFailedEvent,
     ConnectionCheckOutFailedReason,
@@ -62,6 +64,26 @@ from pymongo.write_concern import WriteConcern
 
 # Location of JSON test specifications.
 _TEST_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "retryable_writes", "legacy")
+
+
+class InsertEventListener(EventListener):
+    def succeeded(self, event: CommandSucceededEvent) -> None:
+        super(InsertEventListener, self).succeeded(event)
+        if (
+            event.command_name == "insert"
+            and event.reply.get("writeConcernError", {}).get("code", None) == 91
+        ):
+            client_context.client.admin.command(
+                {
+                    "configureFailPoint": "failCommand",
+                    "mode": {"times": 1},
+                    "data": {
+                        "errorCode": 10107,
+                        "errorLabels": ["RetryableWriteError", "NoWritesPerformed"],
+                        "failCommands": ["insert"],
+                    },
+                }
+            )
 
 
 class TestAllScenarios(SpecRunner):
@@ -106,23 +128,23 @@ def retryable_single_statement_ops(coll):
     return [
         (coll.bulk_write, [[InsertOne({}), InsertOne({})]], {}),
         (coll.bulk_write, [[InsertOne({}), InsertOne({})]], {"ordered": False}),
-        (coll.bulk_write, [[ReplaceOne({}, {})]], {}),
-        (coll.bulk_write, [[ReplaceOne({}, {}), ReplaceOne({}, {})]], {}),
+        (coll.bulk_write, [[ReplaceOne({}, {"a1": 1})]], {}),
+        (coll.bulk_write, [[ReplaceOne({}, {"a2": 1}), ReplaceOne({}, {"a3": 1})]], {}),
         (
             coll.bulk_write,
-            [[UpdateOne({}, {"$set": {"a": 1}}), UpdateOne({}, {"$set": {"a": 1}})]],
+            [[UpdateOne({}, {"$set": {"a4": 1}}), UpdateOne({}, {"$set": {"a5": 1}})]],
             {},
         ),
         (coll.bulk_write, [[DeleteOne({})]], {}),
         (coll.bulk_write, [[DeleteOne({}), DeleteOne({})]], {}),
         (coll.insert_one, [{}], {}),
         (coll.insert_many, [[{}, {}]], {}),
-        (coll.replace_one, [{}, {}], {}),
-        (coll.update_one, [{}, {"$set": {"a": 1}}], {}),
+        (coll.replace_one, [{}, {"a6": 1}], {}),
+        (coll.update_one, [{}, {"$set": {"a7": 1}}], {}),
         (coll.delete_one, [{}], {}),
-        (coll.find_one_and_replace, [{}, {"a": 3}], {}),
-        (coll.find_one_and_update, [{}, {"$set": {"a": 1}}], {}),
-        (coll.find_one_and_delete, [{}, {}], {}),
+        (coll.find_one_and_replace, [{}, {"a8": 1}], {}),
+        (coll.find_one_and_update, [{}, {"$set": {"a9": 1}}], {}),
+        (coll.find_one_and_delete, [{}, {"a10": 1}], {}),
     ]
 
 
@@ -227,9 +249,9 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         self.addCleanup(client.close)
         for method, args, kwargs in retryable_single_statement_ops(client.db.retryable_write_test):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            listener.results.clear()
+            listener.reset()
             method(*args, **kwargs)
-            for event in listener.results["started"]:
+            for event in listener.started_events:
                 self.assertNotIn(
                     "txnNumber",
                     event.command,
@@ -240,10 +262,10 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
     def test_supported_single_statement_supported_cluster(self):
         for method, args, kwargs in retryable_single_statement_ops(self.db.retryable_write_test):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            self.listener.results.clear()
+            self.listener.reset()
             method(*args, **kwargs)
-            commands_started = self.listener.results["started"]
-            self.assertEqual(len(self.listener.results["succeeded"]), 1, msg)
+            commands_started = self.listener.started_events
+            self.assertEqual(len(self.listener.succeeded_events), 1, msg)
             first_attempt = commands_started[0]
             self.assertIn(
                 "lsid",
@@ -283,10 +305,10 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
 
         for method, args, kwargs in retryable_single_statement_ops(self.db.retryable_write_test):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            self.listener.results.clear()
+            self.listener.reset()
             method(*args, **kwargs)
 
-            for event in self.listener.results["started"]:
+            for event in self.listener.started_events:
                 self.assertNotIn(
                     "txnNumber",
                     event.command,
@@ -301,11 +323,11 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
             coll
         ) + retryable_single_statement_ops(coll_w0):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            self.listener.results.clear()
+            self.listener.reset()
             method(*args, **kwargs)
-            started_events = self.listener.results["started"]
-            self.assertEqual(len(self.listener.results["succeeded"]), len(started_events), msg)
-            self.assertEqual(len(self.listener.results["failed"]), 0, msg)
+            started_events = self.listener.started_events
+            self.assertEqual(len(self.listener.succeeded_events), len(started_events), msg)
+            self.assertEqual(len(self.listener.failed_events), 0, msg)
             for event in started_events:
                 self.assertNotIn(
                     "txnNumber",
@@ -324,10 +346,10 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         )
         for method, args, kwargs in retryable_single_statement_ops(client.db.retryable_write_test):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            listener.results.clear()
+            listener.reset()
             with self.assertRaises(ServerSelectionTimeoutError, msg=msg):
                 method(*args, **kwargs)
-            self.assertEqual(len(listener.results["started"]), 0, msg)
+            self.assertEqual(len(listener.started_events), 0, msg)
 
     @client_context.require_replica_set
     @client_context.require_test_commands
@@ -353,11 +375,11 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
 
         for method, args, kwargs in retryable_single_statement_ops(client.db.retryable_write_test):
             msg = "%s(*%r, **%r)" % (method.__name__, args, kwargs)
-            listener.results.clear()
+            listener.reset()
             topology.select_server = mock_select_server
             with self.assertRaises(ConnectionFailure, msg=msg):
                 method(*args, **kwargs)
-            self.assertEqual(len(listener.results["started"]), 1, msg)
+            self.assertEqual(len(listener.started_events), 1, msg)
 
     @client_context.require_replica_set
     @client_context.require_test_commands
@@ -366,7 +388,7 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         large = "s" * 1024 * 1024 * 15
         coll = self.db.retryable_write_test
         coll.delete_many({})
-        self.listener.results.clear()
+        self.listener.reset()
         bulk_result = coll.bulk_write(
             [
                 InsertOne({"_id": 1, "l": large}),
@@ -381,7 +403,7 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
         # Each command should fail and be retried.
         # With OP_MSG 3 inserts are one batch. 2 updates another.
         # 2 deletes a third.
-        self.assertEqual(len(self.listener.results["started"]), 6)
+        self.assertEqual(len(self.listener.started_events), 6)
         self.assertEqual(coll.find_one(), {"_id": 1, "count": 1})
         # Assert the final result
         expected_result = {
@@ -412,7 +434,7 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
                 ]
             )
         )
-        self.listener.results.clear()
+        self.listener.reset()
         with self.client.start_session() as session:
             initial_txn = session._server_session._transaction_id
             try:
@@ -430,9 +452,9 @@ class TestRetryableWrites(IgnoreDeprecationsTest):
             else:
                 self.fail("bulk_write should have failed")
 
-            started = self.listener.results["started"]
+            started = self.listener.started_events
             self.assertEqual(len(started), 3)
-            self.assertEqual(len(self.listener.results["succeeded"]), 1)
+            self.assertEqual(len(self.listener.succeeded_events), 1)
             expected_txn = Int64(initial_txn + 1)
             self.assertEqual(started[0].command["txnNumber"], expected_txn)
             self.assertEqual(started[0].command["lsid"], session.session_id)
@@ -468,9 +490,11 @@ class TestWriteConcernError(IntegrationTest):
         }
 
     @client_context.require_version_min(4, 0)
+    @client_knobs(heartbeat_frequency=0.05, min_heartbeat_interval=0.05)
     def test_RetryableWriteError_error_label(self):
         listener = OvertCommandListener()
         client = rs_or_single_client(retryWrites=True, event_listeners=[listener])
+        self.addCleanup(client.close)
 
         # Ensure collection exists.
         client.pymongo_test.testcoll.insert_one({})
@@ -482,9 +506,7 @@ class TestWriteConcernError(IntegrationTest):
 
         if client_context.version >= Version(4, 4):
             # In MongoDB 4.4+ we rely on the server returning the error label.
-            self.assertIn(
-                "RetryableWriteError", listener.results["succeeded"][-1].reply["errorLabels"]
-            )
+            self.assertIn("RetryableWriteError", listener.succeeded_events[-1].reply["errorLabels"])
 
     @client_context.require_version_min(4, 4)
     def test_RetryableWriteError_error_label_RawBSONDocument(self):
@@ -574,13 +596,50 @@ class TestPoolPausedError(IntegrationTest):
         # Connection check out failures are not reflected in command
         # monitoring because we only publish command events _after_ checking
         # out a connection.
-        started = cmd_listener.results["started"]
+        started = cmd_listener.started_events
         msg = pprint.pformat(cmd_listener.results)
         self.assertEqual(3, len(started), msg)
-        succeeded = cmd_listener.results["succeeded"]
+        succeeded = cmd_listener.succeeded_events
         self.assertEqual(2, len(succeeded), msg)
-        failed = cmd_listener.results["failed"]
+        failed = cmd_listener.failed_events
         self.assertEqual(1, len(failed), msg)
+
+    @client_context.require_failCommand_fail_point
+    @client_context.require_replica_set
+    @client_context.require_version_min(
+        6, 0, 0
+    )  # the spec requires that this prose test only be run on 6.0+
+    @client_knobs(heartbeat_frequency=0.05, min_heartbeat_interval=0.05)
+    def test_returns_original_error_code(
+        self,
+    ):
+        cmd_listener = InsertEventListener()
+        client = rs_or_single_client(retryWrites=True, event_listeners=[cmd_listener])
+        client.test.test.drop()
+        self.addCleanup(client.close)
+        cmd_listener.reset()
+        client.admin.command(
+            {
+                "configureFailPoint": "failCommand",
+                "mode": {"times": 1},
+                "data": {
+                    "writeConcernError": {
+                        "code": 91,
+                        "errorLabels": ["RetryableWriteError"],
+                    },
+                    "failCommands": ["insert"],
+                },
+            }
+        )
+        with self.assertRaises(WriteConcernError) as exc:
+            client.test.test.insert_one({"_id": 1})
+        self.assertEqual(exc.exception.code, 91)
+        client.admin.command(
+            {
+                "configureFailPoint": "failCommand",
+                "mode": "off",
+            }
+        )
 
 
 # TODO: Make this a real integration test where we stepdown the primary.
@@ -604,7 +663,7 @@ class TestRetryableWritesTxnNumber(IgnoreDeprecationsTest):
             raise ConnectionFailure("Connection refused")
 
         for method, args, kwargs in retryable_single_statement_ops(client.db.retryable_write_test):
-            listener.results.clear()
+            listener.reset()
             topology.select_server = raise_connection_err_select_server
             with client.start_session() as session:
                 kwargs = copy.deepcopy(kwargs)
@@ -615,8 +674,8 @@ class TestRetryableWritesTxnNumber(IgnoreDeprecationsTest):
                 # Each operation should fail on the first attempt and succeed
                 # on the second.
                 method(*args, **kwargs)
-                self.assertEqual(len(listener.results["started"]), 1, msg)
-                retry_cmd = listener.results["started"][0].command
+                self.assertEqual(len(listener.started_events), 1, msg)
+                retry_cmd = listener.started_events[0].command
                 sent_txn_id = retry_cmd["txnNumber"]
                 final_txn_id = session._server_session.transaction_id
                 self.assertEqual(Int64(initial_txn_id + 1), sent_txn_id, msg)
